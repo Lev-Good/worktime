@@ -857,35 +857,10 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
 #[cfg(test)]
 mod report_tests {
     use super::*;
-    use std::path::PathBuf;
 
-    /// A real database file with the production schema, removed when the test ends.
-    struct Fixture {
-        conn: Option<Connection>,
-        path: PathBuf,
-    }
-
-    impl Fixture {
-        fn db(&self) -> &Connection {
-            self.conn.as_ref().expect("open database")
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            drop(self.conn.take());
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
-            }
-        }
-    }
-
-    fn fixture() -> Fixture {
-        let path = std::env::temp_dir().join(format!(
-            "worktime-report-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let conn = db::open(&path).expect("test database");
+    /// A seeded in-memory database with the production schema, shared by the unit tests.
+    fn fixture() -> Connection {
+        let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
         conn.execute(
             "INSERT INTO clients (id, profile_id, name, created_at)
@@ -911,10 +886,7 @@ mod report_tests {
         // Non-billable and flagged as paid.
         insert_entry(&conn, &profile, "nb3", "2026-11-05T10:00:00", 3600, 70.0, false, true);
 
-        Fixture {
-            conn: Some(conn),
-            path,
-        }
+        conn
     }
 
     fn insert_entry(
@@ -950,8 +922,8 @@ mod report_tests {
 
     #[test]
     fn report_counts_hours_from_every_entry_but_money_only_from_billable_ones() {
-        let fixture = fixture();
-        let report = report_for(fixture.db(), "2026-11-01", "2026-11-30");
+        let conn = fixture();
+        let report = report_for(&conn, "2026-11-01", "2026-11-30");
 
         assert_eq!((report.from.as_str(), report.to.as_str()), ("2026-11-01", "2026-11-30"));
         assert_eq!(report.entry_count, 5);
@@ -978,8 +950,8 @@ mod report_tests {
 
     #[test]
     fn report_shows_hours_but_no_money_for_a_non_billable_day() {
-        let fixture = fixture();
-        let report = report_for(fixture.db(), "2026-11-04", "2026-11-04");
+        let conn = fixture();
+        let report = report_for(&conn, "2026-11-04", "2026-11-04");
 
         assert_eq!(report.entry_count, 1);
         assert_eq!(report.total_seconds, 3_600, "the hours are still reported");
