@@ -37,6 +37,30 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $lines = Get-Content CHANGELOG.md
+          $heading = $lines | Select-String -SimpleMatch "## [$version]" | Select-Object -First 1
+          if (-not $heading) { throw "CHANGELOG.md has no section for version $version" }
+          $rest = $lines[$heading.LineNumber..($lines.Count - 1)]
+          $next = $rest | Select-String -Pattern '^## \[' | Select-Object -First 1
+          $section = if ($next) { $rest[0..($next.LineNumber - 2)] } else { $rest }
+          $footer = @(
+            '',
+            '---',
+            'הורידו את המתקין המתאים ל-Windows והתקינו (התקנה למשתמש הנוכחי, ללא הרשאות מנהל):',
+            '',
+            '- `WorkTime_..._x64-setup.exe` — מתקין NSIS',
+            '- `WorkTime_..._x64_en-US.msi` — חבילת MSI'
+          ) -join "`n"
+          $body = (($section -join "`n").TrimEnd() + "`n`n" + $footer)
+          "body<<__WORKTIME_NOTES__" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $body | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "__WORKTIME_NOTES__" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Build and publish installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -44,12 +68,6 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "WorkTime v__VERSION__"
-          releaseBody: |
-            הורידו את המתקין המתאים ל-Windows והתקינו (התקנה למשתמש הנוכחי, ללא הרשאות מנהל).
-
-            - `WorkTime_..._x64-setup.exe` — מתקין NSIS
-            - `WorkTime_..._x64_en-US.msi` — חבילת MSI
-
-            פירוט מלא של מה חדש בגרסה נמצא בקובץ `CHANGELOG.md` במאגר.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
