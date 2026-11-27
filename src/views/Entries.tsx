@@ -20,6 +20,9 @@ import {
 
 type Preset = "today" | "week" | "month" | "custom";
 
+/** Rows fetched per request; the list appends another page on demand. */
+const PAGE_SIZE = 100;
+
 export default function Entries() {
   const { currency, projects, clients, notify, reloadKey, timer } = useApp();
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -28,6 +31,12 @@ export default function Entries() {
   const [to, setTo] = useState(todayISO());
   const [clientId, setClientId] = useState("");
   const [projectId, setProjectId] = useState("");
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  const [summary, setSummary] = useState({ total: 0, seconds: 0, amount: 0 });
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [draft, setDraft] = useState<EntryInput | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -38,25 +47,60 @@ export default function Entries() {
     return { from, to };
   }, [preset, from, to]);
 
+  // Typing in the search box waits for a pause instead of querying on every keystroke.
+  useEffect(() => {
+    const pending = window.setTimeout(() => setQuery(search.trim()), 300);
+    return () => window.clearTimeout(pending);
+  }, [search]);
+
+  const fetchPage = (pageOffset: number) =>
+    api.entries({
+      from: range.from,
+      to: range.to,
+      clientId: clientId || null,
+      projectId: projectId || null,
+      search: query || null,
+      limit: PAGE_SIZE,
+      offset: pageOffset,
+    });
+
+  const visible = (rows: Entry[]) =>
+    rows.filter((entry) => entry.endedAt !== null || entry.id === timer.active?.id);
+
   const load = () => {
-    api
-      .entries({
-        from: range.from,
-        to: range.to,
-        clientId: clientId || null,
-        projectId: projectId || null,
-        limit: 500,
+    fetchPage(0)
+      .then((data) => {
+        setEntries(visible(data.entries));
+        setSummary({ total: data.total, seconds: data.totalSeconds, amount: data.totalAmount });
+        setOffset(data.entries.length);
+        setHasMore(data.hasMore);
       })
-      .then((data) =>
-        setEntries(data.filter((entry) => entry.endedAt !== null || entry.id === timer.active?.id))
-      )
       .catch((error) => notify(errorText(error), "error"));
   };
 
-  useEffect(load, [reloadKey, range.from, range.to, clientId, projectId, timer.active?.id]);
+  const loadMore = async () => {
+    setLoadingMore(true);
+    try {
+      const data = await fetchPage(offset);
+      setEntries((current) => [...current, ...visible(data.entries)]);
+      setOffset(offset + data.entries.length);
+      setHasMore(data.hasMore);
+    } catch (error) {
+      notify(errorText(error), "error");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
-  const totalSeconds = entries.reduce((total, entry) => total + entry.durationSec, 0);
-  const totalAmount = entries.reduce((total, entry) => total + entry.amount, 0);
+  useEffect(load, [
+    reloadKey,
+    range.from,
+    range.to,
+    clientId,
+    projectId,
+    query,
+    timer.active?.id,
+  ]);
 
   const save = async () => {
     if (!draft) return;
@@ -125,7 +169,9 @@ export default function Entries() {
         <div>
           <h1 className="page-title">יומן עבודה</h1>
           <p className="page-sub">
-            {entries.length} רשומות · {fmtHM(totalSeconds)} שעות · {fmtMoney(totalAmount, currency)}
+            {summary.total} רשומות · {fmtHM(summary.seconds)} שעות ·{" "}
+            {fmtMoney(summary.amount, currency)}
+            {entries.length < summary.total ? ` · מוצגות ${entries.length}` : ""}
           </p>
         </div>
         <div className="page-actions">
@@ -188,6 +234,13 @@ export default function Entries() {
               placeholder="כל הפרויקטים"
               options={projects.map((project) => ({ value: project.id, label: project.name }))}
               onChange={(event) => setProjectId(event.target.value)}
+            />
+          </Field>
+          <Field label="חיפוש">
+            <Input
+              value={search}
+              placeholder="חיפוש בתיאור…"
+              onChange={(event) => setSearch(event.target.value)}
             />
           </Field>
           <div className="spacer" />
@@ -268,6 +321,13 @@ export default function Entries() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+        {hasMore && (
+          <div style={{ display: "flex", justifyContent: "center", padding: "12px 16px" }}>
+            <Button variant="ghost" loading={loadingMore} onClick={() => void loadMore()}>
+              טעינת עוד ({summary.total - entries.length})
+            </Button>
           </div>
         )}
       </Card>
