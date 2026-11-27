@@ -22,6 +22,8 @@ const CHANGELOG = "CHANGELOG.md";
 
 const read = (name) => readFileSync(file(name), "utf8");
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+// Windows CI can check files out with CRLF, so nothing here may assume LF.
+const eolOf = (text) => (text.includes("\r\n") ? "\r\n" : "\n");
 
 function fail(message) {
   console.error(`\x1b[31m✖\x1b[0m ${message}`);
@@ -31,7 +33,7 @@ function fail(message) {
 function versions() {
   const cargoToml = read(CARGO_TOML);
   const cargoLock = read(CARGO_LOCK);
-  const lockBlock = cargoLock.match(/^name = "worktime"\nversion = "([^"]+)"/m);
+  const lockBlock = cargoLock.match(/^name = "worktime"\r?\nversion = "([^"]+)"/m);
   return {
     [PACKAGE_JSON]: JSON.parse(read(PACKAGE_JSON)).version,
     [TAURI_CONF]: JSON.parse(read(TAURI_CONF)).version,
@@ -41,7 +43,7 @@ function versions() {
 }
 
 function changelogSection(markdown, version) {
-  const lines = markdown.split("\n");
+  const lines = markdown.split(/\r?\n/);
   const start = lines.findIndex((line) => line.startsWith(`## [${version}]`));
   if (start === -1) return null;
   const rest = lines.slice(start + 1);
@@ -113,9 +115,11 @@ function bumpVersion(next, { dryRun, verify }) {
   replace(PACKAGE_JSON, /("version"\s*:\s*")[^"]+(")/, `$1${next}$2`);
   replace(TAURI_CONF, /("version"\s*:\s*")[^"]+(")/, `$1${next}$2`);
   replace(CARGO_TOML, /^(version = ")[^"]+(")/m, `$1${next}$2`);
-  replace(CARGO_LOCK, /(^name = "worktime"\nversion = ")[^"]+(")/m, `$1${next}$2`);
+  replace(CARGO_LOCK, /(^name = "worktime"\r?\nversion = ")[^"]+(")/m, `$1${next}$2`);
 
-  let changelog = read(CHANGELOG);
+  const changelog = read(CHANGELOG);
+  const nl = eolOf(changelog);
+  let updated = changelog;
   let sectionNote;
   if (changelogSection(changelog, next) === null) {
     const date = new Date().toISOString().slice(0, 10);
@@ -126,13 +130,13 @@ function bumpVersion(next, { dryRun, verify }) {
       "### נוסף",
       "- TODO: תארו את השינויים בגרסה הזו — הטקסט הזה הוא הערות הגרסה ב-GitHub ובתוך התוכנה.",
       "",
-    ].join("\n");
-    const lines = changelog.split("\n");
+    ].join(nl);
+    const lines = changelog.split(/\r?\n/);
     const firstSection = lines.findIndex((line) => line.startsWith("## ["));
     if (firstSection === -1) {
-      changelog = `${changelog.trimEnd()}\n\n${entry}`;
+      updated = `${changelog.trimEnd()}${nl}${nl}${entry}`;
     } else {
-      changelog = [...lines.slice(0, firstSection), ...entry.split("\n"), ...lines.slice(firstSection)].join("\n");
+      updated = [...lines.slice(0, firstSection), ...entry.split(nl), ...lines.slice(firstSection)].join(nl);
     }
     sectionNote = `${CHANGELOG}: נוסף קטע "${heading}"`;
   } else {
@@ -146,7 +150,7 @@ function bumpVersion(next, { dryRun, verify }) {
   }
 
   for (const [name, text] of edits) writeFileSync(file(name), text, "utf8");
-  writeFileSync(file(CHANGELOG), changelog, "utf8");
+  if (updated !== changelog) writeFileSync(file(CHANGELOG), updated, "utf8");
 
   console.log(`\x1b[32m✔\x1b[0m הגרסה עודכנה ל-${next} ב-${edits.length} קבצים`);
   for (const [name] of edits) console.log(`   · ${name}`);
