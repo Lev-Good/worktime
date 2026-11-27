@@ -4,7 +4,7 @@ import { settingBoolean, settingNumber, settingString, useApp } from "../lib/sto
 import type { DriveStatus, Settings, UpdateInfo } from "../lib/types";
 import { Badge, Button, Card, Field, Input, Select, Toggle } from "../components/ui";
 import { Icon } from "../components/Icon";
-import { CURRENCY_OPTIONS, clampNumber, fmtDateTime, fmtMoney } from "../lib/format";
+import { CURRENCY_OPTIONS, clampNumber, fmtDateTime } from "../lib/format";
 
 function NumberSetting({
   label,
@@ -548,11 +548,6 @@ export default function SettingsView() {
             <span className="muted small">
               הנתונים נשמרים מקומית במחשב. גיבוי ל-Google Drive מתבצע רק ביוזמתכם.
             </span>
-          </div>
-          <div className="row">
-            <Button variant="ghost" icon="chart" onClick={() => void save("firstRun", "false")}>
-              {fmtMoney(0, currency)}
-            </Button>
           </div>
         </div>
       </Card>

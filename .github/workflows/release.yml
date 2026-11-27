@@ -47,8 +47,8 @@ jobs:
           releaseBody: |
             הורידו את המתקין המתאים ל-Windows והתקינו (התקנה למשתמש הנוכחי, ללא הרשאות מנהל).
 
-            * `WorkTime___VERSION___x64-setup.exe` — מתקין NSIS
-            * `WorkTime___VERSION___x64_en-US.msi` — חבילת MSI
+            - `WorkTime_..._x64-setup.exe` — מתקין NSIS
+            - `WorkTime_..._x64_en-US.msi` — חבילת MSI
 
             פירוט מלא של מה חדש בגרסה נמצא בקובץ `CHANGELOG.md` במאגר.
           releaseDraft: false
