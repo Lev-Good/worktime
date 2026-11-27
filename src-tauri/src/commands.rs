@@ -1287,6 +1287,7 @@ pub fn open_url(app: AppHandle, url: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
+    crate::flush_floating_position(&app);
     app.exit(0);
 }
 
@@ -1332,6 +1333,7 @@ pub fn spawn_ticker(app: AppHandle) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             tick += 1;
+            crate::flush_floating_position(&app);
             let snapshot = timer_snapshot(&app);
             let _ = app.emit("tick", &snapshot);
             crate::tray::sync_status(&app, &snapshot);
