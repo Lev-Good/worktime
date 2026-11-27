@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorText } from "../lib/api";
 import { useApp } from "../lib/store";
 import type { Entry, EntryInput } from "../lib/types";
@@ -67,9 +67,15 @@ export default function Entries() {
   const visible = (rows: Entry[]) =>
     rows.filter((entry) => entry.endedAt !== null || entry.id === timer.active?.id);
 
+  // Every reload takes a ticket, so a slow answer from an older filter cannot overwrite the
+  // list a newer one already produced.
+  const requestTicket = useRef(0);
+
   const load = () => {
+    const ticket = ++requestTicket.current;
     fetchPage(0)
       .then((data) => {
+        if (ticket !== requestTicket.current) return;
         setEntries(visible(data.entries));
         setSummary({ total: data.total, seconds: data.totalSeconds, amount: data.totalAmount });
         setOffset(data.entries.length);
@@ -79,9 +85,11 @@ export default function Entries() {
   };
 
   const loadMore = async () => {
+    const ticket = requestTicket.current;
     setLoadingMore(true);
     try {
       const data = await fetchPage(offset);
+      if (ticket !== requestTicket.current) return; // the filters changed while loading
       setEntries((current) => [...current, ...visible(data.entries)]);
       setOffset(offset + data.entries.length);
       setHasMore(data.hasMore);

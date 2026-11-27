@@ -2,7 +2,7 @@ use crate::db;
 use crate::models::*;
 use crate::AppState;
 use chrono::Local;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use std::sync::MutexGuard;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
@@ -564,6 +564,7 @@ struct EntryQuery<'a> {
 }
 
 /// The filters shared by the page query and the totals query, so both always agree.
+/// It binds `?1`..`?6`; the page query continues with `?7` (limit) and `?8` (offset).
 const ENTRIES_FILTER: &str = r#"
     e.profile_id = ?1 AND e.started_at >= ?2 AND e.started_at <= ?3
       AND (?4 IS NULL OR e.client_id = ?4)
@@ -574,6 +575,17 @@ const ENTRIES_FILTER: &str = r#"
 /// shows fewer rows than the numbers above it account for.
 fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesPage {
     let search = query.search.map(like_pattern);
+    // The bind values for `ENTRIES_FILTER`, in the order its placeholders expect. Both
+    // statements bind the same list, so a filter cannot reach one query and miss the other.
+    let mut binds: Vec<&dyn ToSql> = vec![
+        &profile,
+        &query.from,
+        &query.to,
+        &query.client_id,
+        &query.project_id,
+        &search,
+    ];
+
     // Hours cover every matching entry; money only covers billable ones, exactly like the report.
     let (total, total_seconds, total_amount): (i64, i64, f64) = conn
         .query_row(
@@ -582,36 +594,20 @@ fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesP
                         COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0)
                  FROM entries e WHERE {ENTRIES_FILTER}"
             ),
-            params![
-                profile,
-                query.from,
-                query.to,
-                query.client_id,
-                query.project_id,
-                search
-            ],
+            &binds[..],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap_or((0, 0, 0.0));
+
+    binds.push(&query.limit);
+    binds.push(&query.offset);
 
     let mut entries = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&format!(
         "{ENTRY_SELECT} WHERE {ENTRIES_FILTER}
          ORDER BY e.started_at DESC, e.id DESC LIMIT ?7 OFFSET ?8"
     )) {
-        if let Ok(rows) = stmt.query_map(
-            params![
-                profile,
-                query.from,
-                query.to,
-                query.client_id,
-                query.project_id,
-                search,
-                query.limit,
-                query.offset
-            ],
-            map_entry,
-        ) {
+        if let Ok(rows) = stmt.query_map(&binds[..], map_entry) {
             entries = rows.flatten().collect();
         }
     }
@@ -644,25 +640,31 @@ fn like_pattern(term: &str) -> String {
 mod entries_tests {
     use super::*;
 
+    fn insert_entry(
+        conn: &Connection,
+        profile: &str,
+        id: &str,
+        description: &str,
+        started_at: &str,
+        billable: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO entries (id, profile_id, project_id, client_id, description,
+                started_at, ended_at, duration_sec, rate, amount, billable, paid, created_at)
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, ?5, 0, ?4)",
+            params![id, profile, description, started_at, billable as i64],
+        )
+        .expect("entry");
+    }
+
     /// A seeded in-memory database with the production schema, shared by the unit tests.
     fn fixture() -> Connection {
         let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
         // e2 is not billable: its hour counts as time but must never count as money.
-        let rows = [
-            ("e0", "עבודה על אתר תדמית", "2026-11-02T09:00:00", 1),
-            ("e1", "100% מהמפרט הושלם", "2026-11-02T12:00:00", 1),
-            ("e2", "פגישת צוות", "2026-11-03T09:00:00", 0),
-        ];
-        for (id, description, started_at, billable) in rows {
-            conn.execute(
-                "INSERT INTO entries (id, profile_id, project_id, client_id, description,
-                    started_at, ended_at, duration_sec, rate, amount, billable, paid, created_at)
-                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, ?5, 0, ?4)",
-                params![id, profile, description, started_at, billable],
-            )
-            .expect("entry");
-        }
+        insert_entry(&conn, &profile, "e0", "עבודה על אתר תדמית", "2026-11-02T09:00:00", true);
+        insert_entry(&conn, &profile, "e1", "100% מהמפרט הושלם", "2026-11-02T12:00:00", true);
+        insert_entry(&conn, &profile, "e2", "פגישת צוות", "2026-11-03T09:00:00", false);
         conn
     }
 
@@ -694,6 +696,12 @@ mod entries_tests {
 
         let underscore = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("_")));
         assert_eq!(underscore.total, 0, "no description contains an underscore");
+
+        // The escape character itself is escaped too, so a path stays a literal search.
+        insert_entry(&conn, &profile, "e3", "גיבוי ל-C:\\work", "2026-11-06T09:00:00", true);
+        let backslash = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("\\")));
+        assert_eq!(backslash.total, 1, "a backslash is a character, not an escape");
+        assert_eq!(backslash.entries[0].id, "e3");
     }
 
     #[test]
@@ -722,6 +730,13 @@ mod entries_tests {
         assert_eq!(page.entries.len(), 1, "the offset skips the rows already shown");
         assert_eq!(page.entries[0].id, "e0");
         assert!(!page.has_more);
+
+        let mut beyond = query("2026-11-01", "2026-11-30", None);
+        beyond.offset = 99;
+        let empty = entries_for(&conn, &profile, &beyond);
+        assert!(empty.entries.is_empty(), "an offset past the end returns no rows");
+        assert!(!empty.has_more, "and nothing left to load");
+        assert_eq!(empty.total, 3, "the totals still describe the whole range");
     }
 }
 
