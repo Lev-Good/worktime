@@ -643,35 +643,10 @@ fn like_pattern(term: &str) -> String {
 #[cfg(test)]
 mod entries_tests {
     use super::*;
-    use std::path::PathBuf;
 
-    /// A real database file with the production schema, removed when the test ends.
-    struct Fixture {
-        conn: Option<Connection>,
-        path: PathBuf,
-    }
-
-    impl Fixture {
-        fn db(&self) -> &Connection {
-            self.conn.as_ref().expect("open database")
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            drop(self.conn.take());
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
-            }
-        }
-    }
-
-    fn fixture() -> Fixture {
-        let path = std::env::temp_dir().join(format!(
-            "worktime-entries-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let conn = db::open(&path).expect("test database");
+    /// A seeded in-memory database with the production schema, shared by the unit tests.
+    fn fixture() -> Connection {
+        let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
         // e2 is not billable: its hour counts as time but must never count as money.
         let rows = [
@@ -688,10 +663,7 @@ mod entries_tests {
             )
             .expect("entry");
         }
-        Fixture {
-            conn: Some(conn),
-            path,
-        }
+        conn
     }
 
     fn query<'a>(from: &'a str, to: &'a str, search: Option<&'a str>) -> EntryQuery<'a> {
@@ -708,30 +680,30 @@ mod entries_tests {
 
     #[test]
     fn search_matches_the_description_and_escapes_wildcards() {
-        let fixture = fixture();
-        let profile = db::active_profile_id(fixture.db());
+        let conn = fixture();
+        let profile = db::active_profile_id(&conn);
 
-        let page = entries_for(fixture.db(), &profile, &query("2026-11-01", "2026-11-30", Some("אתר")));
+        let page = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("אתר")));
         assert_eq!(page.total, 1);
         assert_eq!(page.entries[0].id, "e0");
 
         // A "%" typed by the user must match a literal percent sign, not act as a wildcard.
-        let percent = entries_for(fixture.db(), &profile, &query("2026-11-01", "2026-11-30", Some("%")));
+        let percent = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("%")));
         assert_eq!(percent.total, 1, "a percent sign is a character, not a wildcard");
         assert_eq!(percent.entries[0].id, "e1");
 
-        let underscore = entries_for(fixture.db(), &profile, &query("2026-11-01", "2026-11-30", Some("_")));
+        let underscore = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("_")));
         assert_eq!(underscore.total, 0, "no description contains an underscore");
     }
 
     #[test]
     fn a_page_reports_the_full_totals_and_whether_more_rows_follow() {
-        let fixture = fixture();
-        let profile = db::active_profile_id(fixture.db());
+        let conn = fixture();
+        let profile = db::active_profile_id(&conn);
 
         let mut first = query("2026-11-01", "2026-11-30", None);
         first.limit = 2;
-        let page = entries_for(fixture.db(), &profile, &first);
+        let page = entries_for(&conn, &profile, &first);
         assert_eq!(page.entries.len(), 2, "the page is limited");
         assert_eq!(page.total, 3, "the total is not");
         assert_eq!(page.total_seconds, 10_800, "hours cover every entry");
@@ -746,7 +718,7 @@ mod entries_tests {
         let mut second = query("2026-11-01", "2026-11-30", None);
         second.limit = 2;
         second.offset = 2;
-        let page = entries_for(fixture.db(), &profile, &second);
+        let page = entries_for(&conn, &profile, &second);
         assert_eq!(page.entries.len(), 1, "the offset skips the rows already shown");
         assert_eq!(page.entries[0].id, "e0");
         assert!(!page.has_more);
