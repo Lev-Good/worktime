@@ -287,7 +287,11 @@ pub fn sync_active_entry(conn: &Connection) {
         let elapsed = parse_local(&started_at)
             .map(|start| (Local::now().naive_local() - start).num_seconds().max(0))
             .unwrap_or(0);
-        let amount = amount_for_seconds(elapsed, rate);
+        // The clock keeps the real elapsed time, but the amount is priced the way
+        // stop_active will price it, rounding step included, so the number the user
+        // watches does not jump when the timer stops.
+        let billed = round_seconds(elapsed, setting_i64(conn, "roundingMinutes", 0));
+        let amount = amount_for_seconds(billed, rate);
         let _ = conn.execute(
             "UPDATE entries SET duration_sec = ?1, amount = ?2 WHERE id = ?3",
             params![elapsed, amount, id],
@@ -614,5 +618,48 @@ mod tests {
             .query_row("SELECT ended_at FROM entries WHERE id = 'stale'", [], |row| row.get(0))
             .expect("entry");
         assert!(ended_at.is_none(), "a zero limit disables automatic closing");
+    }
+
+    #[test]
+    fn sync_active_entry_prices_the_running_entry_the_way_stopping_will() {
+        let conn = test_connection();
+        let profile = active_profile_id(&conn);
+        set_setting(&conn, "roundingMinutes", "15").expect("setting");
+        insert_test_running_entry(&conn, "running", &profile, 301, 120.0);
+
+        sync_active_entry(&conn);
+
+        let (duration, amount): (i64, f64) = conn
+            .query_row(
+                "SELECT duration_sec, amount FROM entries WHERE id = 'running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("entry");
+        assert!(
+            (301..900).contains(&duration),
+            "the clock keeps counting the real seconds, got {duration}"
+        );
+        assert_ne!(duration % 900, 0, "the stored duration is not rounded, only the price is");
+        assert_eq!(amount, 30.0, "the live amount is the 900s step that stopping charges");
+    }
+
+    #[test]
+    fn sync_active_entry_charges_the_exact_time_when_rounding_is_off() {
+        let conn = test_connection();
+        let profile = active_profile_id(&conn);
+        insert_test_running_entry(&conn, "running", &profile, 600, 360.0);
+
+        sync_active_entry(&conn);
+
+        let (duration, amount): (i64, f64) = conn
+            .query_row(
+                "SELECT duration_sec, amount FROM entries WHERE id = 'running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("entry");
+        assert_eq!(amount, amount_for_seconds(duration, 360.0));
+        assert!((59.0..61.0).contains(&amount), "600s at 360/h is about 60.00, got {amount}");
     }
 }
