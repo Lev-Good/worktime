@@ -132,15 +132,32 @@ npm run tauri dev
 ברירת המחדל: בדיקה אוטומטית פעם ב-12 שעות ברקע, עם התראה כשמתפרסמת גרסה חדשה.
 
 ### פרסום גרסה חדשה
-1. עדכנו את מספר הגרסה בשלושה מקומות: `package.json`, `src-tauri/Cargo.toml`,
-   `src-tauri/tauri.conf.json`.
-2. עדכנו את `CHANGELOG.md` (התוכן ישמש כהערות הגרסה).
-3. בצעו commit, צרו תג ודחפו:
-   ```bash
-   git tag v1.0.1
-   git push origin v1.0.1
-   ```
-4. GitHub Actions (`.github/workflows/release.yml`) בונה את המתקינים ומעלה אותם לדף המהדורה.
+
+פקודה אחת מעדכנת את מספר הגרסה בכל המקומות, פותחת קטע חדש ב־`CHANGELOG.md` ומריצה את בדיקת
+הבנייה (typecheck + build של ה-frontend, בדיוק כמו ב-CI):
+
+```bash
+npm run release:prepare -- 1.0.1
+```
+
+הסקריפט מעדכן את `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`
+ו־`src-tauri/Cargo.lock`, ומוסיף ל־`CHANGELOG.md` כותרת `## [1.0.1] — <תאריך>` עם שורת `TODO`.
+כתבו שם את השינויים — הטקסט הזה הוא בדיוק מה שמוצג בהערות הגרסה ובתוך התוכנה.
+
+אחר כך דחפו את התג, וה-workflow בונה ומפרסם:
+
+```bash
+npm run release:check
+git add -A && git commit -m "Release v1.0.1"
+git tag v1.0.1
+git push origin main v1.0.1
+```
+
+`npm run release:check` מאמת שארבעת הקבצים נושאים אותה גרסה, שקטע ה־CHANGELOG קיים ואינו מכיל
+`TODO`, ושם התג תואם לגרסה. הבדיקה רצה גם בתוך ה-workflow לפני הבנייה — כך שגרסה לא עקבית או הערות
+חסרות לא יפורסמו כתג.
+
+`npm run release:check` הוא גם כלי אבחון: אם משהו לא מסונכרן הוא מפרט בדיוק איזה קובץ נשאר מאחור.
 
 ---
 
@@ -161,6 +178,7 @@ src-tauri/
   src/backup.rs         ייצוא/ייבוא JSON
   src/updates.rs        בדיקת מהדורות GitHub
 scripts/make-icons.mjs  יצירת אייקונים ללא תלויות
+scripts/release.mjs     עדכון גרסה בכל הקבצים, קטע CHANGELOG ובדיקות שחרור
 ```
 
 ---
