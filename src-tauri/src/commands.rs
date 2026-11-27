@@ -574,10 +574,12 @@ const ENTRIES_FILTER: &str = r#"
 /// shows fewer rows than the numbers above it account for.
 fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesPage {
     let search = query.search.map(like_pattern);
+    // Hours cover every matching entry; money only covers billable ones, exactly like the report.
     let (total, total_seconds, total_amount): (i64, i64, f64) = conn
         .query_row(
             &format!(
-                "SELECT COUNT(*), COALESCE(SUM(e.duration_sec),0), COALESCE(SUM(e.amount),0)
+                "SELECT COUNT(*), COALESCE(SUM(e.duration_sec),0),
+                        COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0)
                  FROM entries e WHERE {ENTRIES_FILTER}"
             ),
             params![
@@ -671,17 +673,18 @@ mod entries_tests {
         ));
         let conn = db::open(&path).expect("test database");
         let profile = db::active_profile_id(&conn);
+        // e2 is not billable: its hour counts as time but must never count as money.
         let rows = [
-            ("e0", "עבודה על אתר תדמית", "2026-11-02T09:00:00"),
-            ("e1", "100% מהמפרט הושלם", "2026-11-02T12:00:00"),
-            ("e2", "פגישת צוות", "2026-11-03T09:00:00"),
+            ("e0", "עבודה על אתר תדמית", "2026-11-02T09:00:00", 1),
+            ("e1", "100% מהמפרט הושלם", "2026-11-02T12:00:00", 1),
+            ("e2", "פגישת צוות", "2026-11-03T09:00:00", 0),
         ];
-        for (id, description, started_at) in rows {
+        for (id, description, started_at, billable) in rows {
             conn.execute(
                 "INSERT INTO entries (id, profile_id, project_id, client_id, description,
                     started_at, ended_at, duration_sec, rate, amount, billable, paid, created_at)
-                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, 1, 0, ?4)",
-                params![id, profile, description, started_at],
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, ?5, 0, ?4)",
+                params![id, profile, description, started_at, billable],
             )
             .expect("entry");
         }
@@ -731,8 +734,11 @@ mod entries_tests {
         let page = entries_for(fixture.db(), &profile, &first);
         assert_eq!(page.entries.len(), 2, "the page is limited");
         assert_eq!(page.total, 3, "the total is not");
-        assert_eq!(page.total_seconds, 10_800);
-        assert_eq!(page.total_amount, 300.0);
+        assert_eq!(page.total_seconds, 10_800, "hours cover every entry");
+        assert_eq!(
+            page.total_amount, 200.0,
+            "money covers only the billable entries"
+        );
         assert!(page.has_more);
         assert_eq!(page.entries[0].id, "e2", "newest first");
         assert_eq!(page.entries[1].id, "e1");
