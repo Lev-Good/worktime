@@ -21,6 +21,7 @@
   --radius: 16px;
   --radius-sm: 11px;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  --topbar: rgba(7, 9, 14, 0.82);
   --sidebar: 238px;
   color-scheme: dark;
 }
@@ -46,6 +47,7 @@
   --rose: #d93b5c;
   --rose-soft: rgba(217, 59, 92, 0.1);
   --shadow: 0 18px 40px rgba(16, 24, 40, 0.1);
+  --topbar: rgba(243, 245, 250, 0.86);
   color-scheme: light;
 }
 
@@ -244,7 +246,7 @@ a {
   gap: 12px;
   padding: 14px 24px;
   border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  background: var(--topbar);
   backdrop-filter: blur(12px);
   flex-wrap: wrap;
 }
@@ -1260,6 +1262,10 @@ table.table {
 
 .spacer {
   flex: 1;
+}
+
+.nowrap {
+  white-space: nowrap;
 }
 
 .row {
