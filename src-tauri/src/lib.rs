@@ -2,6 +2,7 @@ mod backup;
 mod commands;
 mod db;
 mod gdrive;
+mod geometry;
 mod models;
 mod reminders;
 mod tray;
@@ -16,10 +17,85 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub notices: Mutex<HashMap<String, i64>>,
     pub tray: Mutex<Option<tray::TrayItems>>,
+    /// Last position the floating clock was dragged to, in logical pixels. Written to the
+    /// settings by `flush_floating_position` instead of on every move event.
+    pub floating_pos: Mutex<Option<(f64, f64)>>,
+}
+
+const FLOATING_WIDTH: f64 = 252.0;
+const FLOATING_HEIGHT: f64 = 92.0;
+const FLOATING_MARGIN: f64 = 28.0;
+/// Minimum part of the floating clock that has to stay on a screen for a saved position
+/// to be reused; anything less means the window would be hard to find or grab.
+const REACHABLE_WIDTH: f64 = 80.0;
+const REACHABLE_HEIGHT: f64 = 40.0;
+
+/// The saved position of the floating clock, if it still lands on a connected monitor.
+fn saved_floating_position(
+    app: &AppHandle,
+    width: f64,
+    height: f64,
+) -> Option<tauri::LogicalPosition<f64>> {
+    let (x, y) = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let x = db::setting(&conn, "floatingX")?.parse::<f64>().ok()?;
+        let y = db::setting(&conn, "floatingY")?.parse::<f64>().ok()?;
+        (x, y)
+    };
+
+    let monitors: Vec<geometry::Rect> = app
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            geometry::Rect::from_physical(
+                position.x,
+                position.y,
+                size.width,
+                size.height,
+                monitor.scale_factor(),
+            )
+        })
+        .collect();
+
+    // With no monitor information there is nothing to check against, so trust the value.
+    if monitors.is_empty() {
+        return Some(tauri::LogicalPosition::new(x, y));
+    }
+
+    let window = geometry::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    geometry::is_reachable(window, &monitors, REACHABLE_WIDTH, REACHABLE_HEIGHT)
+        .then(|| tauri::LogicalPosition::new(x, y))
+}
+
+/// Stores the floating clock's last dragged position. A drag emits a move event per pixel,
+/// so the position is collected there and written here (ticker, hide, quit) instead.
+pub fn flush_floating_position(app: &AppHandle) {
+    let (x, y) = {
+        let state = app.state::<AppState>();
+        let mut pending = state.floating_pos.lock().unwrap_or_else(|e| e.into_inner());
+        match pending.take() {
+            Some(position) => position,
+            None => return,
+        }
+    };
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = db::set_setting(&conn, "floatingX", &format!("{x:.0}"));
+    let _ = db::set_setting(&conn, "floatingY", &format!("{y:.0}"));
 }
 
 pub fn set_floating_visible(app: &AppHandle, visible: bool) -> Result<bool, String> {
     if !visible {
+        flush_floating_position(app);
         if let Some(window) = app.get_webview_window("floating") {
             let _ = window.hide();
         }
@@ -53,11 +129,15 @@ pub fn set_floating_visible(app: &AppHandle, visible: bool) -> Result<bool, Stri
             let scale = monitor.scale_factor();
             let width = monitor.size().width as f64 / scale;
             let height = monitor.size().height as f64 / scale;
-            let _ = window.set_position(tauri::LogicalPosition::new(28.0, height - 92.0 - 96.0));
-            let _ = window.set_size(tauri::LogicalSize::new(
-                (width - 56.0).clamp(180.0, 252.0),
-                92.0,
-            ));
+            let size = (width - 56.0).clamp(180.0, FLOATING_WIDTH);
+            // Restore the last dragged position unless that spot is no longer on any screen
+            // (monitor unplugged, resolution changed) — then start in the corner again.
+            let position =
+                saved_floating_position(app, size, FLOATING_HEIGHT).unwrap_or_else(|| {
+                    tauri::LogicalPosition::new(FLOATING_MARGIN, height - FLOATING_HEIGHT - 96.0)
+                });
+            let _ = window.set_position(position);
+            let _ = window.set_size(tauri::LogicalSize::new(size, FLOATING_HEIGHT));
         }
     }
 
@@ -97,6 +177,7 @@ pub fn run() {
                 db: Mutex::new(connection),
                 notices: Mutex::new(HashMap::new()),
                 tray: Mutex::new(None),
+                floating_pos: Mutex::new(None),
             });
 
             tray::build(app.handle())?;
@@ -141,6 +222,15 @@ pub fn run() {
                 if window.label() == "main" {
                     api.prevent_close();
                     let _ = window.hide();
+                }
+            }
+            if let WindowEvent::Moved(position) = event {
+                if window.label() == "floating" {
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    let scale = if scale > 0.0 { scale } else { 1.0 };
+                    let state = window.state::<AppState>();
+                    *state.floating_pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((position.x as f64 / scale, position.y as f64 / scale));
                 }
             }
         })

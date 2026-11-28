@@ -459,7 +459,10 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                 }
             });
         }
-        "quit" => app.exit(0),
+        "quit" => {
+            crate::flush_floating_position(app);
+            app.exit(0)
+        }
         _ => {}
     }
 }
