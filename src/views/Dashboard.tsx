@@ -39,7 +39,9 @@ export default function Dashboard() {
   const workday = settingNumber(settings, "workdayHours", 8.5);
   const goalSeconds = goalHours * 3600;
   const todaySeconds = data?.todaySeconds ?? 0;
-  const liveEarnings = (timer.elapsedSec / 3600) * timer.rate;
+  // The backend prices the running entry the way stopping will (rounding included), so
+  // show its amount instead of recomputing the raw elapsed time here.
+  const liveEarnings = timer.active?.amount ?? 0;
 
   const weekData = useMemo(
     () => (data?.weekDays ?? []).map((day) => ({ label: day.label, seconds: day.seconds })),
