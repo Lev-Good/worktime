@@ -16,7 +16,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     let alive = true;
-    Promise.all([api.dashboard(), api.entries({ limit: 6 })])
+    Promise.all([api.dashboard(), api.entries({ limit: 6 }).then((page) => page.entries)])
       .then(([dashboardData, entries]) => {
         if (!alive) return;
         setData(dashboardData);

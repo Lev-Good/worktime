@@ -70,6 +70,17 @@ pub struct Entry {
     pub paid: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EntriesPage {
+    pub entries: Vec<Entry>,
+    /// Every entry matching the filters, not just the rows in this page.
+    pub total: i64,
+    pub total_seconds: i64,
+    pub total_amount: f64,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Payment {

@@ -2,7 +2,7 @@ use crate::db;
 use crate::models::*;
 use crate::AppState;
 use chrono::Local;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use std::sync::MutexGuard;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
@@ -526,27 +526,218 @@ pub fn list_entries(
     to: Option<String>,
     client_id: Option<String>,
     project_id: Option<String>,
+    search: Option<String>,
     limit: Option<i64>,
-) -> CmdResult<Vec<Entry>> {
+    offset: Option<i64>,
+) -> CmdResult<EntriesPage> {
     let conn = lock(&state);
     db::sync_active_entry(&conn);
     let profile = db::active_profile_id(&conn);
     let from = from.unwrap_or_else(|| db::add_days(&db::today_end()[..10], -30) + "T00:00:00");
     let to = to.unwrap_or_else(db::today_end);
-    let limit = limit.unwrap_or(500);
-    let mut stmt = conn
-        .prepare(&format!(
-            "{ENTRY_SELECT}
-             WHERE e.profile_id = ?1 AND e.started_at >= ?2 AND e.started_at <= ?3
-               AND (?4 IS NULL OR e.client_id = ?4)
-               AND (?5 IS NULL OR e.project_id = ?5)
-             ORDER BY e.started_at DESC LIMIT ?6"
-        ))
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![profile, from, to, client_id, project_id, limit], map_entry)
-        .map_err(|e| e.to_string())?;
-    Ok(rows.flatten().collect())
+    let query = EntryQuery {
+        from: &from,
+        to: &to,
+        client_id: client_id.as_deref().filter(|value| !value.is_empty()),
+        project_id: project_id.as_deref().filter(|value| !value.is_empty()),
+        search: search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        limit: limit.unwrap_or(ENTRIES_PAGE_MAX).clamp(1, ENTRIES_PAGE_MAX),
+        offset: offset.unwrap_or(0).max(0),
+    };
+    Ok(entries_for(&conn, &profile, &query))
+}
+
+/// Largest page `list_entries` will return in one go.
+const ENTRIES_PAGE_MAX: i64 = 500;
+
+struct EntryQuery<'a> {
+    from: &'a str,
+    to: &'a str,
+    client_id: Option<&'a str>,
+    project_id: Option<&'a str>,
+    search: Option<&'a str>,
+    limit: i64,
+    offset: i64,
+}
+
+/// The filters shared by the page query and the totals query, so both always agree.
+/// It binds `?1`..`?6`; the page query continues with `?7` (limit) and `?8` (offset).
+const ENTRIES_FILTER: &str = r#"
+    e.profile_id = ?1 AND e.started_at >= ?2 AND e.started_at <= ?3
+      AND (?4 IS NULL OR e.client_id = ?4)
+      AND (?5 IS NULL OR e.project_id = ?5)
+      AND (?6 IS NULL OR e.description LIKE ?6 ESCAPE '\')"#;
+
+/// One page of the journal plus the totals of every matching entry, so the screen never
+/// shows fewer rows than the numbers above it account for.
+fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesPage {
+    let search = query.search.map(like_pattern);
+    // The bind values for `ENTRIES_FILTER`, in the order its placeholders expect. Both
+    // statements bind the same list, so a filter cannot reach one query and miss the other.
+    let mut binds: Vec<&dyn ToSql> = vec![
+        &profile,
+        &query.from,
+        &query.to,
+        &query.client_id,
+        &query.project_id,
+        &search,
+    ];
+
+    // Hours cover every matching entry; money only covers billable ones, exactly like the report.
+    let (total, total_seconds, total_amount): (i64, i64, f64) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(e.duration_sec),0),
+                        COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0)
+                 FROM entries e WHERE {ENTRIES_FILTER}"
+            ),
+            &binds[..],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0.0));
+
+    binds.push(&query.limit);
+    binds.push(&query.offset);
+
+    let mut entries = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "{ENTRY_SELECT} WHERE {ENTRIES_FILTER}
+         ORDER BY e.started_at DESC, e.id DESC LIMIT ?7 OFFSET ?8"
+    )) {
+        if let Ok(rows) = stmt.query_map(&binds[..], map_entry) {
+            entries = rows.flatten().collect();
+        }
+    }
+
+    EntriesPage {
+        has_more: (query.offset + entries.len() as i64) < total,
+        entries,
+        total,
+        total_seconds,
+        total_amount: db::round_amount(total_amount),
+    }
+}
+
+/// Turns a search term into a LIKE pattern, escaping `%`, `_` and the escape character
+/// itself so a term typed by the user only ever matches those characters literally.
+fn like_pattern(term: &str) -> String {
+    let mut pattern = String::with_capacity(term.len() + 2);
+    pattern.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+#[cfg(test)]
+mod entries_tests {
+    use super::*;
+
+    fn insert_entry(
+        conn: &Connection,
+        profile: &str,
+        id: &str,
+        description: &str,
+        started_at: &str,
+        billable: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO entries (id, profile_id, project_id, client_id, description,
+                started_at, ended_at, duration_sec, rate, amount, billable, paid, created_at)
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, ?5, 0, ?4)",
+            params![id, profile, description, started_at, billable as i64],
+        )
+        .expect("entry");
+    }
+
+    /// A seeded in-memory database with the production schema, shared by the unit tests.
+    fn fixture() -> Connection {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        // e2 is not billable: its hour counts as time but must never count as money.
+        insert_entry(&conn, &profile, "e0", "עבודה על אתר תדמית", "2026-11-02T09:00:00", true);
+        insert_entry(&conn, &profile, "e1", "100% מהמפרט הושלם", "2026-11-02T12:00:00", true);
+        insert_entry(&conn, &profile, "e2", "פגישת צוות", "2026-11-03T09:00:00", false);
+        conn
+    }
+
+    fn query<'a>(from: &'a str, to: &'a str, search: Option<&'a str>) -> EntryQuery<'a> {
+        EntryQuery {
+            from,
+            to,
+            client_id: None,
+            project_id: None,
+            search,
+            limit: 50,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn search_matches_the_description_and_escapes_wildcards() {
+        let conn = fixture();
+        let profile = db::active_profile_id(&conn);
+
+        let page = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("אתר")));
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].id, "e0");
+
+        // A "%" typed by the user must match a literal percent sign, not act as a wildcard.
+        let percent = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("%")));
+        assert_eq!(percent.total, 1, "a percent sign is a character, not a wildcard");
+        assert_eq!(percent.entries[0].id, "e1");
+
+        let underscore = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("_")));
+        assert_eq!(underscore.total, 0, "no description contains an underscore");
+
+        // The escape character itself is escaped too, so a path stays a literal search.
+        insert_entry(&conn, &profile, "e3", "גיבוי ל-C:\\work", "2026-11-06T09:00:00", true);
+        let backslash = entries_for(&conn, &profile, &query("2026-11-01", "2026-11-30", Some("\\")));
+        assert_eq!(backslash.total, 1, "a backslash is a character, not an escape");
+        assert_eq!(backslash.entries[0].id, "e3");
+    }
+
+    #[test]
+    fn a_page_reports_the_full_totals_and_whether_more_rows_follow() {
+        let conn = fixture();
+        let profile = db::active_profile_id(&conn);
+
+        let mut first = query("2026-11-01", "2026-11-30", None);
+        first.limit = 2;
+        let page = entries_for(&conn, &profile, &first);
+        assert_eq!(page.entries.len(), 2, "the page is limited");
+        assert_eq!(page.total, 3, "the total is not");
+        assert_eq!(page.total_seconds, 10_800, "hours cover every entry");
+        assert_eq!(
+            page.total_amount, 200.0,
+            "money covers only the billable entries"
+        );
+        assert!(page.has_more);
+        assert_eq!(page.entries[0].id, "e2", "newest first");
+        assert_eq!(page.entries[1].id, "e1");
+
+        let mut second = query("2026-11-01", "2026-11-30", None);
+        second.limit = 2;
+        second.offset = 2;
+        let page = entries_for(&conn, &profile, &second);
+        assert_eq!(page.entries.len(), 1, "the offset skips the rows already shown");
+        assert_eq!(page.entries[0].id, "e0");
+        assert!(!page.has_more);
+
+        let mut beyond = query("2026-11-01", "2026-11-30", None);
+        beyond.offset = 99;
+        let empty = entries_for(&conn, &profile, &beyond);
+        assert!(empty.entries.is_empty(), "an offset past the end returns no rows");
+        assert!(!empty.has_more, "and nothing left to load");
+        assert_eq!(empty.total, 3, "the totals still describe the whole range");
+    }
 }
 
 #[tauri::command]

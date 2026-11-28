@@ -7,7 +7,7 @@ import type {
   Dashboard,
   DriveFile,
   DriveStatus,
-  Entry,
+  EntriesPage,
   EntryInput,
   NotificationItem,
   Payment,
@@ -41,8 +41,10 @@ export const api = {
     to?: string;
     clientId?: string | null;
     projectId?: string | null;
+    search?: string | null;
     limit?: number;
-  }) => invoke<Entry[]>("list_entries", params),
+    offset?: number;
+  }) => invoke<EntriesPage>("list_entries", params),
   startTimer: (projectId: string | null, description = "") =>
     invoke<TimerSnapshot>("start_timer", { projectId, description }),
   stopTimer: () => invoke<TimerSnapshot>("stop_timer"),

@@ -60,6 +60,14 @@ export type Entry = {
   paid: boolean;
 };
 
+export type EntriesPage = {
+  entries: Entry[];
+  total: number;
+  totalSeconds: number;
+  totalAmount: number;
+  hasMore: boolean;
+};
+
 export type Payment = {
   id: string;
   profileId: string;
