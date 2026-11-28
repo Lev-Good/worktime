@@ -595,13 +595,9 @@ fn stop_active(conn: &Connection) -> Result<(), String> {
     db::sync_active_entry(conn);
     let active = active_entry(conn);
     if let Some(entry) = active {
-        let mut seconds = entry.duration_sec.max(0);
         let rounding = db::setting_i64(conn, "roundingMinutes", 0);
-        if rounding > 0 {
-            let step = rounding * 60;
-            seconds = ((seconds + step - 1) / step) * step;
-        }
-        let amount = db::round_amount(seconds as f64 / 3600.0 * entry.rate);
+        let seconds = db::round_seconds(entry.duration_sec.max(0), rounding);
+        let amount = db::amount_for_seconds(seconds, entry.rate);
         conn.execute(
             "UPDATE entries SET ended_at = ?1, duration_sec = ?2, amount = ?3 WHERE id = ?4",
             params![db::now_str(), seconds, amount, entry.id],
@@ -651,7 +647,7 @@ pub fn save_entry(app: AppHandle, state: State<'_, AppState>, entry: EntryInput)
             None => None,
         };
         let rate = db::resolve_rate(&conn, entry.project_id.as_deref(), client_id.as_deref(), &profile);
-        let amount = db::round_amount(seconds as f64 / 3600.0 * rate);
+        let amount = db::amount_for_seconds(seconds, rate);
 
         if let Some(id) = &entry.id {
             conn.execute(
@@ -1341,4 +1337,59 @@ pub fn spawn_ticker(app: AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_active_rounds_up_and_prices_the_entry() {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        db::set_setting(&conn, "roundingMinutes", "15").expect("setting");
+        db::insert_test_running_entry(&conn, "running", &profile, 301, 120.0);
+
+        stop_active(&conn).expect("stop");
+
+        let (ended_at, duration_sec, amount): (Option<String>, i64, f64) = conn
+            .query_row(
+                "SELECT ended_at, duration_sec, amount FROM entries WHERE id = 'running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("entry");
+        assert!(ended_at.is_some(), "the timer should be closed");
+        assert_eq!(duration_sec, 900, "301s rounds up to a 15 minute step");
+        assert_eq!(amount, 30.0, "900s at 120/hour is 30.00");
+    }
+
+    #[test]
+    fn stop_active_is_a_no_op_when_no_timer_is_running() {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        db::insert_test_running_entry(&conn, "running", &profile, 600, 100.0);
+
+        stop_active(&conn).expect("first stop");
+        let closed: (i64, f64) = conn
+            .query_row("SELECT duration_sec, amount FROM entries WHERE id = 'running'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("entry");
+
+        stop_active(&conn).expect("second stop is a no-op");
+
+        let after: (i64, f64, i64) = conn
+            .query_row(
+                "SELECT duration_sec, amount, (SELECT COUNT(*) FROM entries) FROM entries WHERE id = 'running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("entry");
+        assert_eq!(
+            after,
+            (closed.0, closed.1, 1),
+            "a second stop must not touch the closed entry or open a new one"
+        );
+    }
 }
