@@ -12,7 +12,8 @@ use tauri_plugin_opener::OpenerExt;
 type CmdResult<T> = Result<T, String>;
 
 const ENTRY_SELECT: &str = "SELECT e.id, e.profile_id, e.project_id, p.name, e.client_id, c.name,
-        e.description, e.started_at, e.ended_at, e.duration_sec, e.rate, e.amount, e.billable, e.paid
+        e.description, e.started_at, e.ended_at, e.duration_sec, e.rate_agorot, e.amount_agorot,
+        e.billable, e.paid
      FROM entries e
      LEFT JOIN projects p ON p.id = e.project_id
      LEFT JOIN clients c ON c.id = e.client_id";
@@ -29,8 +30,8 @@ fn map_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         started_at: row.get(7)?,
         ended_at: row.get(8)?,
         duration_sec: row.get(9)?,
-        rate: row.get(10)?,
-        amount: row.get(11)?,
+        rate: db::to_shekels(row.get(10)?),
+        amount: db::to_shekels(row.get(11)?),
         billable: row.get::<_, i64>(12)? == 1,
         paid: row.get::<_, i64>(13)? == 1,
     })
@@ -81,31 +82,31 @@ fn broadcast(app: &AppHandle) {
     crate::tray::refresh(app);
 }
 
-/// Worked seconds in the range, and the money that range is actually worth.
+/// Worked seconds in the range, and the money that range is actually worth in agorot.
 ///
 /// Hours count every entry (the time was spent), money counts only entries marked
 /// billable, so the dashboard agrees with the report and with "pending payment".
-pub(crate) fn section_total(conn: &Connection, profile: &str, from: &str, to: &str) -> (i64, f64) {
+pub(crate) fn section_total(conn: &Connection, profile: &str, from: &str, to: &str) -> (i64, i64) {
     conn.query_row(
         "SELECT COALESCE(SUM(duration_sec),0),
-                COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0)
+                COALESCE(SUM(CASE WHEN billable = 1 THEN amount_agorot ELSE 0 END),0)
          FROM entries
          WHERE profile_id = ?1 AND started_at >= ?2 AND started_at <= ?3",
         params![profile, from, to],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
-    .unwrap_or((0, 0.0))
+    .unwrap_or((0, 0))
 }
 
-/// Money already collected: paid and billable entries only.
-fn paid_total(conn: &Connection, profile: &str) -> f64 {
+/// Money already collected, in agorot: paid and billable entries only.
+fn paid_total(conn: &Connection, profile: &str) -> i64 {
     conn.query_row(
-        "SELECT COALESCE(SUM(amount),0) FROM entries
+        "SELECT COALESCE(SUM(amount_agorot),0) FROM entries
          WHERE profile_id = ?1 AND paid = 1 AND billable = 1",
         params![profile],
         |row| row.get(0),
     )
-    .unwrap_or(0.0)
+    .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -118,7 +119,8 @@ pub fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Bootst
     {
         let mut stmt = conn
             .prepare(
-                "SELECT p.id, p.name, p.hourly_rate, p.currency, p.color, p.is_active, p.created_at,
+                "SELECT p.id, p.name, p.hourly_rate_agorot, p.currency, p.color, p.is_active,
+                    p.created_at,
                     COALESCE((SELECT SUM(duration_sec) FROM entries WHERE profile_id = p.id),0)
                  FROM profiles p ORDER BY p.is_active DESC, p.created_at ASC",
             )
@@ -128,7 +130,7 @@ pub fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Bootst
                 Ok(Profile {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    hourly_rate: row.get(2)?,
+                    hourly_rate: db::to_shekels(row.get(2)?),
                     currency: row.get(3)?,
                     color: row.get(4)?,
                     is_active: row.get::<_, i64>(5)? == 1,
@@ -170,14 +172,14 @@ pub fn dashboard(state: State<'_, AppState>) -> CmdResult<Dashboard> {
         section_total(&conn, &profile, &db::week_start(), &db::today_end());
     let (month_seconds, _) = section_total(&conn, &profile, &db::month_start(), &db::today_end());
 
-    let unpaid_total: f64 = conn
+    let unpaid_total: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount),0) FROM entries
+            "SELECT COALESCE(SUM(amount_agorot),0) FROM entries
              WHERE profile_id = ?1 AND billable = 1 AND paid = 0",
             params![profile],
             |row| row.get(0),
         )
-        .unwrap_or(0.0);
+        .unwrap_or(0);
     let paid_total = paid_total(&conn, &profile);
     let entries_today: i64 = conn
         .query_row(
@@ -234,10 +236,10 @@ pub fn dashboard(state: State<'_, AppState>) -> CmdResult<Dashboard> {
         today_seconds,
         week_seconds,
         month_seconds,
-        today_earnings: db::round_amount(today_earnings),
-        week_earnings: db::round_amount(week_earnings),
-        unpaid_total: db::round_amount(unpaid_total),
-        paid_total: db::round_amount(paid_total),
+        today_earnings: db::to_shekels(today_earnings),
+        week_earnings: db::to_shekels(week_earnings),
+        unpaid_total: db::to_shekels(unpaid_total),
+        paid_total: db::to_shekels(paid_total),
         entries_today,
         active_projects,
         active_clients,
@@ -252,9 +254,9 @@ pub fn list_clients(state: State<'_, AppState>) -> CmdResult<Vec<Client>> {
     let mut stmt = conn
         .prepare(
             "SELECT c.id, c.profile_id, c.name, c.contact, c.email, c.phone, c.address, c.notes,
-                    c.hourly_rate, c.archived, c.created_at,
+                    c.hourly_rate_agorot, c.archived, c.created_at,
                     COALESCE((SELECT SUM(duration_sec) FROM entries WHERE client_id = c.id),0),
-                    COALESCE((SELECT SUM(amount) FROM entries WHERE client_id = c.id AND paid = 0 AND billable = 1),0)
+                    COALESCE((SELECT SUM(amount_agorot) FROM entries WHERE client_id = c.id AND paid = 0 AND billable = 1),0)
              FROM clients c WHERE c.profile_id = ?1
              ORDER BY c.archived ASC, c.name COLLATE NOCASE ASC",
         )
@@ -270,11 +272,11 @@ pub fn list_clients(state: State<'_, AppState>) -> CmdResult<Vec<Client>> {
                 phone: row.get(5)?,
                 address: row.get(6)?,
                 notes: row.get(7)?,
-                hourly_rate: row.get(8)?,
+                hourly_rate: row.get::<_, Option<i64>>(8)?.map(db::to_shekels),
                 archived: row.get::<_, i64>(9)? == 1,
                 created_at: row.get(10)?,
                 total_seconds: row.get(11)?,
-                unpaid_amount: db::round_amount(row.get::<_, f64>(12)?),
+                unpaid_amount: db::to_shekels(row.get::<_, i64>(12)?),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -301,7 +303,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
         if exists > 0 {
             conn.execute(
                 "UPDATE clients SET name = ?1, contact = ?2, email = ?3, phone = ?4, address = ?5,
-                    notes = ?6, hourly_rate = ?7, archived = ?8 WHERE id = ?9",
+                    notes = ?6, hourly_rate_agorot = ?7, archived = ?8 WHERE id = ?9",
                 params![
                     name,
                     client.contact,
@@ -309,7 +311,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
                     client.phone,
                     client.address,
                     client.notes,
-                    client.hourly_rate,
+                    client.hourly_rate.map(db::to_agorot),
                     client.archived as i64,
                     id
                 ],
@@ -318,7 +320,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
         } else {
             conn.execute(
                 "INSERT INTO clients (id, profile_id, name, contact, email, phone, address, notes,
-                    hourly_rate, archived, created_at)
+                    hourly_rate_agorot, archived, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     id,
@@ -329,7 +331,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
                     client.phone,
                     client.address,
                     client.notes,
-                    client.hourly_rate,
+                    client.hourly_rate.map(db::to_agorot),
                     client.archived as i64,
                     db::now_str()
                 ],
@@ -343,7 +345,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
     let profile = db::active_profile_id(&conn);
     conn.query_row(
         "SELECT c.id, c.profile_id, c.name, c.contact, c.email, c.phone, c.address, c.notes,
-                c.hourly_rate, c.archived, c.created_at, 0, 0
+                c.hourly_rate_agorot, c.archived, c.created_at, 0, 0
          FROM clients c WHERE c.id = ?1 AND c.profile_id = ?2",
         params![id, profile],
         |row| {
@@ -356,7 +358,7 @@ pub fn save_client(app: AppHandle, state: State<'_, AppState>, client: ClientInp
                 phone: row.get(5)?,
                 address: row.get(6)?,
                 notes: row.get(7)?,
-                hourly_rate: row.get(8)?,
+                hourly_rate: row.get::<_, Option<i64>>(8)?.map(db::to_shekels),
                 archived: row.get::<_, i64>(9)? == 1,
                 created_at: row.get(10)?,
                 total_seconds: 0,
@@ -391,9 +393,9 @@ pub fn list_projects(state: State<'_, AppState>) -> CmdResult<Vec<Project>> {
     let mut stmt = conn
         .prepare(
             "SELECT p.id, p.profile_id, p.client_id, c.name, p.name, p.description, p.status,
-                    p.hourly_rate, p.budget, p.color, p.archived, p.created_at,
+                    p.hourly_rate_agorot, p.budget_agorot, p.color, p.archived, p.created_at,
                     COALESCE((SELECT SUM(duration_sec) FROM entries WHERE project_id = p.id),0),
-                    COALESCE((SELECT SUM(amount) FROM entries WHERE project_id = p.id AND paid = 0 AND billable = 1),0),
+                    COALESCE((SELECT SUM(amount_agorot) FROM entries WHERE project_id = p.id AND paid = 0 AND billable = 1),0),
                     (SELECT MAX(started_at) FROM entries WHERE project_id = p.id)
              FROM projects p LEFT JOIN clients c ON c.id = p.client_id
              WHERE p.profile_id = ?1
@@ -410,13 +412,13 @@ pub fn list_projects(state: State<'_, AppState>) -> CmdResult<Vec<Project>> {
                 name: row.get(4)?,
                 description: row.get(5)?,
                 status: row.get(6)?,
-                hourly_rate: row.get(7)?,
-                budget: row.get(8)?,
+                hourly_rate: row.get::<_, Option<i64>>(7)?.map(db::to_shekels),
+                budget: row.get::<_, Option<i64>>(8)?.map(db::to_shekels),
                 color: row.get(9)?,
                 archived: row.get::<_, i64>(10)? == 1,
                 created_at: row.get(11)?,
                 total_seconds: row.get(12)?,
-                unpaid_amount: db::round_amount(row.get::<_, f64>(13)?),
+                unpaid_amount: db::to_shekels(row.get::<_, i64>(13)?),
                 last_used_at: row.get(14)?,
             })
         })
@@ -446,14 +448,14 @@ pub fn save_project(app: AppHandle, state: State<'_, AppState>, project: Project
         if exists > 0 {
             conn.execute(
                 "UPDATE projects SET name = ?1, client_id = ?2, description = ?3, status = ?4,
-                    hourly_rate = ?5, budget = ?6, color = ?7, archived = ?8 WHERE id = ?9",
+                    hourly_rate_agorot = ?5, budget_agorot = ?6, color = ?7, archived = ?8 WHERE id = ?9",
                 params![
                     name,
                     project.client_id,
                     project.description,
                     status,
-                    project.hourly_rate,
-                    project.budget,
+                    project.hourly_rate.map(db::to_agorot),
+                    project.budget.map(db::to_agorot),
                     color,
                     project.archived as i64,
                     id
@@ -463,7 +465,7 @@ pub fn save_project(app: AppHandle, state: State<'_, AppState>, project: Project
         } else {
             conn.execute(
                 "INSERT INTO projects (id, profile_id, client_id, name, description, status,
-                    hourly_rate, budget, color, archived, created_at)
+                    hourly_rate_agorot, budget_agorot, color, archived, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     id,
@@ -472,8 +474,8 @@ pub fn save_project(app: AppHandle, state: State<'_, AppState>, project: Project
                     name,
                     project.description,
                     status,
-                    project.hourly_rate,
-                    project.budget,
+                    project.hourly_rate.map(db::to_agorot),
+                    project.budget.map(db::to_agorot),
                     color,
                     project.archived as i64,
                     db::now_str()
@@ -488,7 +490,7 @@ pub fn save_project(app: AppHandle, state: State<'_, AppState>, project: Project
     let profile = db::active_profile_id(&conn);
     conn.query_row(
         "SELECT p.id, p.profile_id, p.client_id, c.name, p.name, p.description, p.status,
-                p.hourly_rate, p.budget, p.color, p.archived, p.created_at, 0, 0, NULL
+                p.hourly_rate_agorot, p.budget_agorot, p.color, p.archived, p.created_at, 0, 0, NULL
          FROM projects p LEFT JOIN clients c ON c.id = p.client_id
          WHERE p.id = ?1 AND p.profile_id = ?2",
         params![id, profile],
@@ -501,8 +503,8 @@ pub fn save_project(app: AppHandle, state: State<'_, AppState>, project: Project
                 name: row.get(4)?,
                 description: row.get(5)?,
                 status: row.get(6)?,
-                hourly_rate: row.get(7)?,
-                budget: row.get(8)?,
+                hourly_rate: row.get::<_, Option<i64>>(7)?.map(db::to_shekels),
+                budget: row.get::<_, Option<i64>>(8)?.map(db::to_shekels),
                 color: row.get(9)?,
                 archived: row.get::<_, i64>(10)? == 1,
                 created_at: row.get(11)?,
@@ -598,17 +600,17 @@ fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesP
     ];
 
     // Hours cover every matching entry; money only covers billable ones, exactly like the report.
-    let (total, total_seconds, total_amount): (i64, i64, f64) = conn
+    let (total, total_seconds, total_amount): (i64, i64, i64) = conn
         .query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(e.duration_sec),0),
-                        COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0)
+                        COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount_agorot ELSE 0 END),0)
                  FROM entries e WHERE {ENTRIES_FILTER}"
             ),
             &binds[..],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap_or((0, 0, 0.0));
+        .unwrap_or((0, 0, 0));
 
     binds.push(&query.limit);
     binds.push(&query.offset);
@@ -628,7 +630,7 @@ fn entries_for(conn: &Connection, profile: &str, query: &EntryQuery) -> EntriesP
         entries,
         total,
         total_seconds,
-        total_amount: db::round_amount(total_amount),
+        total_amount: db::to_shekels(total_amount),
     }
 }
 
@@ -661,8 +663,9 @@ mod entries_tests {
     ) {
         conn.execute(
             "INSERT INTO entries (id, profile_id, project_id, client_id, description,
-                started_at, ended_at, duration_sec, rate, amount, billable, paid, created_at)
-             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 100, 100, ?5, 0, ?4)",
+                started_at, ended_at, duration_sec, rate_agorot, amount_agorot, billable, paid,
+                created_at)
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 3600, 10000, 10000, ?5, 0, ?4)",
             params![id, profile, description, started_at, billable as i64],
         )
         .expect("entry");
@@ -770,11 +773,11 @@ pub fn start_timer(app: AppHandle, state: State<'_, AppState>, project_id: Optio
                 .flatten(),
             None => None,
         };
-        let rate = db::resolve_rate(&conn, project_id.as_deref(), client_id.as_deref(), &profile);
+        let rate = db::resolve_rate_agorot(&conn, project_id.as_deref(), client_id.as_deref(), &profile);
         let description = description.unwrap_or_default().trim().to_string();
         conn.execute(
             "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
-                ended_at, duration_sec, rate, amount, billable, paid, created_at)
+                ended_at, duration_sec, rate_agorot, amount_agorot, billable, paid, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, 0, ?8, 0, ?6)",
             params![
                 uuid::Uuid::new_v4().to_string(),
@@ -795,14 +798,26 @@ pub fn start_timer(app: AppHandle, state: State<'_, AppState>, project_id: Optio
 
 fn stop_active(conn: &Connection) -> Result<(), String> {
     db::sync_active_entry(conn);
-    let active = active_entry(conn);
-    if let Some(entry) = active {
+    // The rate is read in agorot straight from the row, so the price is computed once,
+    // in integers, without a shekel round trip in between.
+    let active: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT id, duration_sec, rate_agorot FROM entries WHERE ended_at IS NULL
+             ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+
+    if let Some((id, worked, rate_agorot)) = active {
         let rounding = db::setting_i64(conn, "roundingMinutes", 0);
-        let seconds = db::round_seconds(entry.duration_sec.max(0), rounding);
-        let amount = db::amount_for_seconds(seconds, entry.rate);
+        let seconds = db::round_seconds(worked.max(0), rounding);
+        let amount = db::amount_agorot(seconds, rate_agorot);
         conn.execute(
-            "UPDATE entries SET ended_at = ?1, duration_sec = ?2, amount = ?3 WHERE id = ?4",
-            params![db::now_str(), seconds, amount, entry.id],
+            "UPDATE entries SET ended_at = ?1, duration_sec = ?2, amount_agorot = ?3 WHERE id = ?4",
+            params![db::now_str(), seconds, amount, id],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -848,13 +863,14 @@ pub fn save_entry(app: AppHandle, state: State<'_, AppState>, entry: EntryInput)
                 .flatten(),
             None => None,
         };
-        let rate = db::resolve_rate(&conn, entry.project_id.as_deref(), client_id.as_deref(), &profile);
-        let amount = db::amount_for_seconds(seconds, rate);
+        let rate = db::resolve_rate_agorot(&conn, entry.project_id.as_deref(), client_id.as_deref(), &profile);
+        let amount = db::amount_agorot(seconds, rate);
 
         if let Some(id) = &entry.id {
             conn.execute(
                 "UPDATE entries SET project_id = ?1, client_id = ?2, description = ?3, started_at = ?4,
-                    ended_at = ?5, duration_sec = ?6, rate = ?7, amount = ?8, billable = ?9, paid = ?10
+                    ended_at = ?5, duration_sec = ?6, rate_agorot = ?7, amount_agorot = ?8,
+                    billable = ?9, paid = ?10
                  WHERE id = ?11",
                 params![
                     entry.project_id,
@@ -874,7 +890,7 @@ pub fn save_entry(app: AppHandle, state: State<'_, AppState>, entry: EntryInput)
         } else {
             conn.execute(
                 "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
-                    ended_at, duration_sec, rate, amount, billable, paid, created_at)
+                    ended_at, duration_sec, rate_agorot, amount_agorot, billable, paid, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?6)",
                 params![
                     uuid::Uuid::new_v4().to_string(),
@@ -937,15 +953,15 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
     let to_ts = format!("{to}T23:59:59");
 
     // Hours cover every entry in the range; money only covers billable entries.
-    let (total_seconds, total_earnings, entry_count): (i64, f64, i64) = conn
+    let (total_seconds, total_earnings, entry_count): (i64, i64, i64) = conn
         .query_row(
             "SELECT COALESCE(SUM(duration_sec),0),
-                    COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0), COUNT(*)
+                    COALESCE(SUM(CASE WHEN billable = 1 THEN amount_agorot ELSE 0 END),0), COUNT(*)
              FROM entries WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3",
             params![profile, from_ts, to_ts],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap_or((0, 0.0, 0));
+        .unwrap_or((0, 0, 0));
 
     let billable_seconds: i64 = conn
         .query_row(
@@ -955,19 +971,19 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let paid_earnings: f64 = conn
+    let paid_earnings: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount),0) FROM entries
+            "SELECT COALESCE(SUM(amount_agorot),0) FROM entries
              WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3 AND billable = 1 AND paid = 1",
             params![profile, from_ts, to_ts],
             |row| row.get(0),
         )
-        .unwrap_or(0.0);
+        .unwrap_or(0);
 
     let mut by_day = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT substr(started_at,1,10) AS day, COALESCE(SUM(duration_sec),0),
-                COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0)
+                COALESCE(SUM(CASE WHEN billable = 1 THEN amount_agorot ELSE 0 END),0)
          FROM entries WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3
          GROUP BY day ORDER BY day ASC",
     ) {
@@ -980,7 +996,7 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
                 key: day,
                 label,
                 seconds: row.get(1)?,
-                earnings: db::round_amount(row.get::<_, f64>(2)?),
+                earnings: db::to_shekels(row.get::<_, i64>(2)?),
                 color: None,
             })
         }) {
@@ -991,7 +1007,7 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
     let mut by_client = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT COALESCE(c.id,''), COALESCE(c.name,'ללא לקוח'), COALESCE(SUM(e.duration_sec),0),
-                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0), c.hourly_rate
+                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount_agorot ELSE 0 END),0)
          FROM entries e LEFT JOIN clients c ON c.id = e.client_id
          WHERE e.profile_id = ?1 AND e.started_at BETWEEN ?2 AND ?3
          GROUP BY COALESCE(c.id,'') ORDER BY 3 DESC",
@@ -1001,7 +1017,7 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
                 key: row.get(0)?,
                 label: row.get(1)?,
                 seconds: row.get(2)?,
-                earnings: db::round_amount(row.get::<_, f64>(3)?),
+                earnings: db::to_shekels(row.get::<_, i64>(3)?),
                 color: None,
             })
         }) {
@@ -1012,7 +1028,7 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
     let mut by_project = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT COALESCE(p.id,''), COALESCE(p.name,'ללא פרויקט'), COALESCE(SUM(e.duration_sec),0),
-                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0), p.color
+                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount_agorot ELSE 0 END),0), p.color
          FROM entries e LEFT JOIN projects p ON p.id = e.project_id
          WHERE e.profile_id = ?1 AND e.started_at BETWEEN ?2 AND ?3
          GROUP BY COALESCE(p.id,'') ORDER BY 3 DESC",
@@ -1022,7 +1038,7 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
                 key: row.get(0)?,
                 label: row.get(1)?,
                 seconds: row.get(2)?,
-                earnings: db::round_amount(row.get::<_, f64>(3)?),
+                earnings: db::to_shekels(row.get::<_, i64>(3)?),
                 color: row.get(4)?,
             })
         }) {
@@ -1045,9 +1061,9 @@ fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
         to: to.to_string(),
         total_seconds,
         billable_seconds,
-        total_earnings: db::round_amount(total_earnings),
-        paid_earnings: db::round_amount(paid_earnings),
-        unpaid_earnings: db::round_amount(total_earnings - paid_earnings),
+        total_earnings: db::to_shekels(total_earnings),
+        paid_earnings: db::to_shekels(paid_earnings),
+        unpaid_earnings: db::to_shekels(total_earnings - paid_earnings),
         entry_count,
         by_day,
         by_client,
@@ -1078,15 +1094,15 @@ mod report_tests {
         .expect("project");
 
         // Billable and still unpaid.
-        insert_entry(&conn, &profile, "b1", "2026-11-02T09:00:00", 3600, 100.0, true, false);
+        insert_entry(&conn, &profile, "b1", "2026-11-02T09:00:00", 3600, 10_000, true, false);
         // Not billable but priced: this is the money that must not leak into the totals.
-        insert_entry(&conn, &profile, "nb1", "2026-11-02T13:00:00", 7200, 200.0, false, false);
+        insert_entry(&conn, &profile, "nb1", "2026-11-02T13:00:00", 7200, 20_000, false, false);
         // Billable and paid.
-        insert_entry(&conn, &profile, "b2", "2026-11-03T10:00:00", 1800, 50.0, true, true);
+        insert_entry(&conn, &profile, "b2", "2026-11-03T10:00:00", 1800, 5_000, true, true);
         // A whole day of non-billable work.
-        insert_entry(&conn, &profile, "nb2", "2026-11-04T10:00:00", 3600, 90.0, false, false);
+        insert_entry(&conn, &profile, "nb2", "2026-11-04T10:00:00", 3600, 9_000, false, false);
         // Non-billable and flagged as paid.
-        insert_entry(&conn, &profile, "nb3", "2026-11-05T10:00:00", 3600, 70.0, false, true);
+        insert_entry(&conn, &profile, "nb3", "2026-11-05T10:00:00", 3600, 7_000, false, true);
 
         conn
     }
@@ -1097,20 +1113,20 @@ mod report_tests {
         id: &str,
         started_at: &str,
         duration_sec: i64,
-        amount: f64,
+        amount_agorot: i64,
         billable: bool,
         paid: bool,
     ) {
         conn.execute(
             "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
-                ended_at, duration_sec, rate, amount, billable, paid, created_at)
-             VALUES (?1, ?2, 'pr1', 'c1', '', ?3, ?3, ?4, 100, ?5, ?6, ?7, ?3)",
+                ended_at, duration_sec, rate_agorot, amount_agorot, billable, paid, created_at)
+             VALUES (?1, ?2, 'pr1', 'c1', '', ?3, ?3, ?4, 10000, ?5, ?6, ?7, ?3)",
             params![
                 id,
                 profile_id,
                 started_at,
                 duration_sec,
-                amount,
+                amount_agorot,
                 billable as i64,
                 paid as i64
             ],
@@ -1222,8 +1238,8 @@ pub fn list_payments(state: State<'_, AppState>) -> CmdResult<Vec<Payment>> {
     let profile = db::active_profile_id(&conn);
     let mut stmt = conn
         .prepare(
-            "SELECT pm.id, pm.profile_id, pm.client_id, c.name, pm.project_id, p.name, pm.amount,
-                    pm.currency, pm.method, pm.note, pm.paid_at, pm.created_at
+            "SELECT pm.id, pm.profile_id, pm.client_id, c.name, pm.project_id, p.name,
+                    pm.amount_agorot, pm.currency, pm.method, pm.note, pm.paid_at, pm.created_at
              FROM payments pm
              LEFT JOIN clients c ON c.id = pm.client_id
              LEFT JOIN projects p ON p.id = pm.project_id
@@ -1239,7 +1255,7 @@ pub fn list_payments(state: State<'_, AppState>) -> CmdResult<Vec<Payment>> {
                 client_name: row.get(3)?,
                 project_id: row.get(4)?,
                 project_name: row.get(5)?,
-                amount: row.get(6)?,
+                amount: db::to_shekels(row.get(6)?),
                 currency: row.get(7)?,
                 method: row.get(8)?,
                 note: row.get(9)?,
@@ -1253,7 +1269,8 @@ pub fn list_payments(state: State<'_, AppState>) -> CmdResult<Vec<Payment>> {
 
 #[tauri::command]
 pub fn save_payment(app: AppHandle, state: State<'_, AppState>, payment: PaymentInput) -> CmdResult<()> {
-    if payment.amount <= 0.0 {
+    let amount_agorot = db::to_agorot(payment.amount);
+    if amount_agorot <= 0 {
         return Err("יש להזין סכום חיובי".into());
     }
     {
@@ -1262,12 +1279,12 @@ pub fn save_payment(app: AppHandle, state: State<'_, AppState>, payment: Payment
         let currency = db::setting_or(&conn, "currency", "ILS");
         if let Some(id) = &payment.id {
             conn.execute(
-                "UPDATE payments SET client_id = ?1, project_id = ?2, amount = ?3, method = ?4,
-                    note = ?5, paid_at = ?6 WHERE id = ?7",
+                "UPDATE payments SET client_id = ?1, project_id = ?2, amount_agorot = ?3,
+                    method = ?4, note = ?5, paid_at = ?6 WHERE id = ?7",
                 params![
                     payment.client_id,
                     payment.project_id,
-                    payment.amount,
+                    amount_agorot,
                     payment.method,
                     payment.note,
                     payment.paid_at,
@@ -1277,15 +1294,15 @@ pub fn save_payment(app: AppHandle, state: State<'_, AppState>, payment: Payment
             .map_err(|e| e.to_string())?;
         } else {
             conn.execute(
-                "INSERT INTO payments (id, profile_id, client_id, project_id, amount, currency,
-                    method, note, paid_at, created_at)
+                "INSERT INTO payments (id, profile_id, client_id, project_id, amount_agorot,
+                    currency, method, note, paid_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     uuid::Uuid::new_v4().to_string(),
                     profile,
                     payment.client_id,
                     payment.project_id,
-                    payment.amount,
+                    amount_agorot,
                     currency,
                     payment.method,
                     payment.note,
@@ -1445,8 +1462,15 @@ pub fn save_profile(app: AppHandle, state: State<'_, AppState>, profile: Profile
         let color = profile.color.clone().unwrap_or_else(|| "#7c9cff".into());
         if exists > 0 {
             conn.execute(
-                "UPDATE profiles SET name = ?1, hourly_rate = ?2, currency = ?3, color = ?4 WHERE id = ?5",
-                params![name, profile.hourly_rate, currency, color, id],
+                "UPDATE profiles SET name = ?1, hourly_rate_agorot = ?2, currency = ?3, color = ?4
+                 WHERE id = ?5",
+                params![
+                    name,
+                    db::to_agorot(profile.hourly_rate),
+                    currency,
+                    color,
+                    id
+                ],
             )
             .map_err(|e| e.to_string())?;
         } else {
@@ -1454,12 +1478,13 @@ pub fn save_profile(app: AppHandle, state: State<'_, AppState>, profile: Profile
                 .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))
                 .unwrap_or(0);
             conn.execute(
-                "INSERT INTO profiles (id, name, hourly_rate, currency, color, is_active, created_at)
+                "INSERT INTO profiles (id, name, hourly_rate_agorot, currency, color, is_active,
+                    created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id,
                     name,
-                    profile.hourly_rate,
+                    db::to_agorot(profile.hourly_rate),
                     currency,
                     color,
                     (count == 0) as i64,
@@ -1473,13 +1498,14 @@ pub fn save_profile(app: AppHandle, state: State<'_, AppState>, profile: Profile
     crate::tray::refresh(&app);
     let conn = lock(&state);
     conn.query_row(
-        "SELECT id, name, hourly_rate, currency, color, is_active, created_at, 0 FROM profiles WHERE id = ?1",
+        "SELECT id, name, hourly_rate_agorot, currency, color, is_active, created_at, 0
+         FROM profiles WHERE id = ?1",
         params![id],
         |row| {
             Ok(Profile {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                hourly_rate: row.get(2)?,
+                hourly_rate: db::to_shekels(row.get(2)?),
                 currency: row.get(3)?,
                 color: row.get(4)?,
                 is_active: row.get::<_, i64>(5)? == 1,
@@ -1647,9 +1673,17 @@ pub fn notify(app: AppHandle, state: State<'_, AppState>, title: String, body: S
 pub fn spawn_ticker(app: AppHandle) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;
+        let mut last_beat = Local::now().naive_local();
+        let mut idle_notified = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             tick += 1;
+            // The wall clock, not a monotonic timer: it is what jumps forward when the
+            // machine suspends, which is exactly the gap that must not be billed.
+            let now = Local::now().naive_local();
+            let gap = (now - last_beat).num_seconds();
+            last_beat = now;
+            pause_unavailable(&app, gap, &mut idle_notified);
             crate::flush_floating_position(&app);
             let snapshot = timer_snapshot(&app);
             let _ = app.emit("tick", &snapshot);
@@ -1662,6 +1696,81 @@ pub fn spawn_ticker(app: AppHandle) {
     });
 }
 
+/// The seconds of a tick that cannot have been worked: a suspended machine (the ticker
+/// missed its beat by far more than a second) or a user who has been away past the limit.
+pub fn unavailable_seconds(gap: i64, idle_millis: Option<u64>, idle_limit_minutes: i64) -> i64 {
+    if gap <= 0 {
+        return 0;
+    }
+    if gap >= crate::idle::SLEEP_GAP_SECONDS {
+        return gap;
+    }
+    match idle_millis {
+        Some(millis) if idle_limit_minutes > 0 && millis >= idle_limit_minutes as u64 * 60_000 => gap,
+        _ => 0,
+    }
+}
+
+/// Keeps suspended and idle time out of the running entry, and says so once per episode so
+/// the user knows why the number stopped moving.
+fn pause_unavailable(app: &AppHandle, gap: i64, idle_notified: &mut bool) {
+    let seconds = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = db::setting_i64(&conn, "idlePauseMinutes", db::DEFAULT_IDLE_PAUSE_MINUTES);
+        unavailable_seconds(gap, crate::idle::idle_millis(), limit)
+    };
+    if seconds <= 0 {
+        *idle_notified = false;
+        return;
+    }
+
+    let paused = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::pause_active_entry(&conn, seconds)
+    };
+    if paused.is_none() {
+        return;
+    }
+
+    if gap >= crate::idle::SLEEP_GAP_SECONDS {
+        *idle_notified = false;
+        notice(
+            app,
+            "זמן שינה לא נספר",
+            &format!(
+                "המחשב לא הגיב במשך {} דקות, ולכן הזמן הזה לא נכלל ברשומה.",
+                (gap / 60).max(1)
+            ),
+            "warning",
+        );
+    } else if !*idle_notified {
+        *idle_notified = true;
+        notice(
+            app,
+            "הטיימר הושהה — אין פעילות",
+            "לא זוהתה פעילות במקלדת או בעכבר, ולכן הזמן לא נכלל ברשומה. הוא ימשיך להיספר ברגע שתחזרו.",
+            "warning",
+        );
+    }
+}
+
+/// Records a notification in the app and shows it on the desktop, unless the user muted them.
+fn notice(app: &AppHandle, title: &str, body: &str, kind: &str) {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        if !db::setting_bool(&conn, "notificationsEnabled", true) {
+            return;
+        }
+        let profile = db::active_profile_id(&conn);
+        let _ = db::push_notification(&conn, &profile, title, body, kind);
+    }
+    let _ = app.notification().builder().title(title).body(body).show();
+    let _ = app.emit("state-changed", ());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,40 +1780,44 @@ mod tests {
         let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
         db::set_setting(&conn, "roundingMinutes", "15").expect("setting");
-        db::insert_test_running_entry(&conn, "running", &profile, 301, 120.0);
+        db::insert_test_running_entry(&conn, "running", &profile, 301, 12_000);
 
         stop_active(&conn).expect("stop");
 
-        let (ended_at, duration_sec, amount): (Option<String>, i64, f64) = conn
+        let (ended_at, duration_sec, amount): (Option<String>, i64, i64) = conn
             .query_row(
-                "SELECT ended_at, duration_sec, amount FROM entries WHERE id = 'running'",
+                "SELECT ended_at, duration_sec, amount_agorot FROM entries WHERE id = 'running'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("entry");
         assert!(ended_at.is_some(), "the timer should be closed");
         assert_eq!(duration_sec, 900, "301s rounds up to a 15 minute step");
-        assert_eq!(amount, 30.0, "900s at 120/hour is 30.00");
+        assert_eq!(amount, 3_000, "900s at 120/hour is 3000 agorot");
     }
 
     #[test]
     fn stop_active_is_a_no_op_when_no_timer_is_running() {
         let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
-        db::insert_test_running_entry(&conn, "running", &profile, 600, 100.0);
+        db::insert_test_running_entry(&conn, "running", &profile, 600, 10_000);
 
         stop_active(&conn).expect("first stop");
-        let closed: (i64, f64) = conn
-            .query_row("SELECT duration_sec, amount FROM entries WHERE id = 'running'", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+        let closed: (i64, i64) = conn
+            .query_row(
+                "SELECT duration_sec, amount_agorot FROM entries WHERE id = 'running'",
+                [],
+                |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                },
+            )
             .expect("entry");
 
         stop_active(&conn).expect("second stop is a no-op");
 
-        let after: (i64, f64, i64) = conn
+        let after: (i64, i64, i64) = conn
             .query_row(
-                "SELECT duration_sec, amount, (SELECT COUNT(*) FROM entries) FROM entries WHERE id = 'running'",
+                "SELECT duration_sec, amount_agorot, (SELECT COUNT(*) FROM entries) FROM entries WHERE id = 'running'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -1722,7 +1835,7 @@ mod tests {
         profile: &str,
         hour: u32,
         duration_sec: i64,
-        amount: f64,
+        amount_agorot: i64,
         billable: bool,
         paid: bool,
     ) {
@@ -1734,14 +1847,14 @@ mod tests {
             .to_string();
         conn.execute(
             "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
-                ended_at, duration_sec, rate, amount, billable, paid, created_at)
-             VALUES (?1, ?2, NULL, NULL, '', ?3, ?3, ?4, 100.0, ?5, ?6, ?7, ?3)",
+                ended_at, duration_sec, rate_agorot, amount_agorot, billable, paid, created_at)
+             VALUES (?1, ?2, NULL, NULL, '', ?3, ?3, ?4, 10000, ?5, ?6, ?7, ?3)",
             params![
                 id,
                 profile,
                 started_at,
                 duration_sec,
-                amount,
+                amount_agorot,
                 billable as i64,
                 paid as i64
             ],
@@ -1753,25 +1866,45 @@ mod tests {
     fn section_total_counts_every_hour_but_only_billable_money() {
         let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
-        insert_finished_entry(&conn, "billed", &profile, 9, 3600, 100.0, true, false);
-        insert_finished_entry(&conn, "internal", &profile, 10, 1800, 50.0, false, false);
-        insert_finished_entry(&conn, "short", &profile, 11, 600, 20.0, true, false);
+        insert_finished_entry(&conn, "billed", &profile, 9, 3600, 10_000, true, false);
+        insert_finished_entry(&conn, "internal", &profile, 10, 1800, 5_000, false, false);
+        insert_finished_entry(&conn, "short", &profile, 11, 600, 2_000, true, false);
 
         let (seconds, amount) =
             section_total(&conn, &profile, &db::today_start(), &db::today_end());
 
         assert_eq!(seconds, 6000, "hours still include the non-billable entry");
-        assert_eq!(amount, 120.0, "money counts the billable entries only");
+        assert_eq!(amount, 12_000, "money counts the billable entries only");
     }
 
     #[test]
     fn paid_total_ignores_entries_paid_but_marked_not_billable() {
         let conn = db::test_connection();
         let profile = db::active_profile_id(&conn);
-        insert_finished_entry(&conn, "paid-billable", &profile, 9, 3600, 100.0, true, true);
-        insert_finished_entry(&conn, "paid-extra", &profile, 10, 3600, 50.0, false, true);
-        insert_finished_entry(&conn, "open", &profile, 11, 3600, 30.0, true, false);
+        insert_finished_entry(&conn, "paid-billable", &profile, 9, 3600, 10_000, true, true);
+        insert_finished_entry(&conn, "paid-extra", &profile, 10, 3600, 5_000, false, true);
+        insert_finished_entry(&conn, "open", &profile, 11, 3600, 3_000, true, false);
 
-        assert_eq!(paid_total(&conn, &profile), 100.0);
+        assert_eq!(paid_total(&conn, &profile), 10_000);
+    }
+
+    #[test]
+    fn unavailable_seconds_skips_sleep_and_respects_the_idle_limit() {
+        // A tick that arrives on time is work, whatever the keyboard is doing.
+        assert_eq!(unavailable_seconds(1, None, 15), 0);
+        assert_eq!(unavailable_seconds(1, Some(60_000), 15), 0, "a quiet minute is not idle");
+
+        // No input past the limit: the tick stops being work.
+        assert_eq!(unavailable_seconds(1, Some(15 * 60_000), 15), 1);
+        assert_eq!(unavailable_seconds(1, Some(10 * 60_000), 15), 0);
+        assert_eq!(unavailable_seconds(1, Some(10 * 60_000), 0), 0, "0 turns the idle pause off");
+
+        // A missed beat of a minute and a half or more means the machine was suspended.
+        assert_eq!(
+            unavailable_seconds(crate::idle::SLEEP_GAP_SECONDS, Some(0), 15),
+            crate::idle::SLEEP_GAP_SECONDS
+        );
+        assert_eq!(unavailable_seconds(3 * 3600, None, 15), 3 * 3600, "a whole sleep is skipped");
+        assert_eq!(unavailable_seconds(0, Some(60 * 60_000), 15), 0, "a zero gap adds nothing");
     }
 }

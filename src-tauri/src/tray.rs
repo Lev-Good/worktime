@@ -100,14 +100,14 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         }
         let (today_seconds, today_earnings) =
             commands::section_total(&conn, &profile, &db::today_start(), &db::today_end());
-        let unpaid: f64 = conn
+        let unpaid: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(amount),0) FROM entries
+                "SELECT COALESCE(SUM(amount_agorot),0) FROM entries
                  WHERE profile_id = ?1 AND billable = 1 AND paid = 0",
                 rusqlite::params![profile],
                 |row| row.get(0),
             )
-            .unwrap_or(0.0);
+            .unwrap_or(0);
         (
             commands::snapshot_of(&conn),
             db::setting_bool(&conn, "floatingEnabled", false),
@@ -177,7 +177,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             "היום: {} שעות · {}{}",
             hours_label(today_seconds),
             symbol,
-            format!("{:.0}", today_earnings)
+            format!("{:.0}", db::to_shekels(today_earnings))
         ),
         false,
         None::<&str>,
@@ -185,7 +185,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let unpaid_item = MenuItem::with_id(
         app,
         "sum_unpaid",
-        format!("ממתין לתשלום: {}{}", symbol, format!("{:.0}", unpaid)),
+        format!(
+            "ממתין לתשלום: {}{}",
+            symbol,
+            format!("{:.0}", db::to_shekels(unpaid))
+        ),
         false,
         None::<&str>,
     )?;

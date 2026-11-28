@@ -3,6 +3,7 @@ mod commands;
 mod db;
 mod gdrive;
 mod geometry;
+mod idle;
 mod models;
 mod reminders;
 mod tray;

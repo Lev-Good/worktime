@@ -222,6 +222,13 @@ export default function SettingsView() {
               min={1}
               onSave={(value) => void save("autoStopHours", String(value))}
             />
+            <NumberSetting
+              label="השהיה בחוסר פעילות (דקות)"
+              hint="בלי תזוזת מקלדת או עכבר, הזמן מפסיק להיספר. 0 מבטל"
+              value={settingNumber(local, "idlePauseMinutes", 15)}
+              min={0}
+              onSave={(value) => void save("idlePauseMinutes", String(value))}
+            />
           </div>
           <div style={{ marginTop: 8 }}>
             <Toggle
