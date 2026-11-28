@@ -98,14 +98,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
                 projects = rows.flatten().collect();
             }
         }
-        let (today_seconds, today_earnings): (i64, f64) = conn
-            .query_row(
-                "SELECT COALESCE(SUM(duration_sec),0), COALESCE(SUM(amount),0) FROM entries
-                 WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3",
-                rusqlite::params![profile, db::today_start(), db::today_end()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap_or((0, 0.0));
+        let (today_seconds, today_earnings) =
+            commands::section_total(&conn, &profile, &db::today_start(), &db::today_end());
         let unpaid: f64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(amount),0) FROM entries

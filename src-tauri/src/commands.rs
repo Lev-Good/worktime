@@ -81,14 +81,31 @@ fn broadcast(app: &AppHandle) {
     crate::tray::refresh(app);
 }
 
-fn section_total(conn: &Connection, profile: &str, from: &str, to: &str) -> (i64, f64) {
+/// Worked seconds in the range, and the money that range is actually worth.
+///
+/// Hours count every entry (the time was spent), money counts only entries marked
+/// billable, so the dashboard agrees with the report and with "pending payment".
+pub(crate) fn section_total(conn: &Connection, profile: &str, from: &str, to: &str) -> (i64, f64) {
     conn.query_row(
-        "SELECT COALESCE(SUM(duration_sec),0), COALESCE(SUM(amount),0) FROM entries
+        "SELECT COALESCE(SUM(duration_sec),0),
+                COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0)
+         FROM entries
          WHERE profile_id = ?1 AND started_at >= ?2 AND started_at <= ?3",
         params![profile, from, to],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .unwrap_or((0, 0.0))
+}
+
+/// Money already collected: paid and billable entries only.
+fn paid_total(conn: &Connection, profile: &str) -> f64 {
+    conn.query_row(
+        "SELECT COALESCE(SUM(amount),0) FROM entries
+         WHERE profile_id = ?1 AND paid = 1 AND billable = 1",
+        params![profile],
+        |row| row.get(0),
+    )
+    .unwrap_or(0.0)
 }
 
 #[tauri::command]
@@ -161,13 +178,7 @@ pub fn dashboard(state: State<'_, AppState>) -> CmdResult<Dashboard> {
             |row| row.get(0),
         )
         .unwrap_or(0.0);
-    let paid_total: f64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(amount),0) FROM entries WHERE profile_id = ?1 AND paid = 1",
-            params![profile],
-            |row| row.get(0),
-        )
-        .unwrap_or(0.0);
+    let paid_total = paid_total(&conn, &profile);
     let entries_today: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3",
@@ -1703,5 +1714,64 @@ mod tests {
             (closed.0, closed.1, 1),
             "a second stop must not touch the closed entry or open a new one"
         );
+    }
+
+    fn insert_finished_entry(
+        conn: &Connection,
+        id: &str,
+        profile: &str,
+        hour: u32,
+        duration_sec: i64,
+        amount: f64,
+        billable: bool,
+        paid: bool,
+    ) {
+        let started_at = Local::now()
+            .date_naive()
+            .and_hms_opt(hour, 0, 0)
+            .expect("clock time")
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        conn.execute(
+            "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
+                ended_at, duration_sec, rate, amount, billable, paid, created_at)
+             VALUES (?1, ?2, NULL, NULL, '', ?3, ?3, ?4, 100.0, ?5, ?6, ?7, ?3)",
+            params![
+                id,
+                profile,
+                started_at,
+                duration_sec,
+                amount,
+                billable as i64,
+                paid as i64
+            ],
+        )
+        .expect("insert entry");
+    }
+
+    #[test]
+    fn section_total_counts_every_hour_but_only_billable_money() {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        insert_finished_entry(&conn, "billed", &profile, 9, 3600, 100.0, true, false);
+        insert_finished_entry(&conn, "internal", &profile, 10, 1800, 50.0, false, false);
+        insert_finished_entry(&conn, "short", &profile, 11, 600, 20.0, true, false);
+
+        let (seconds, amount) =
+            section_total(&conn, &profile, &db::today_start(), &db::today_end());
+
+        assert_eq!(seconds, 6000, "hours still include the non-billable entry");
+        assert_eq!(amount, 120.0, "money counts the billable entries only");
+    }
+
+    #[test]
+    fn paid_total_ignores_entries_paid_but_marked_not_billable() {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        insert_finished_entry(&conn, "paid-billable", &profile, 9, 3600, 100.0, true, true);
+        insert_finished_entry(&conn, "paid-extra", &profile, 10, 3600, 50.0, false, true);
+        insert_finished_entry(&conn, "open", &profile, 11, 3600, 30.0, true, false);
+
+        assert_eq!(paid_total(&conn, &profile), 100.0);
     }
 }
