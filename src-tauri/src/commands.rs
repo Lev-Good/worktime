@@ -724,14 +724,21 @@ pub fn set_entry_paid(app: AppHandle, state: State<'_, AppState>, id: String, pa
 #[tauri::command]
 pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult<Report> {
     let conn = lock(&state);
-    db::sync_active_entry(&conn);
-    let profile = db::active_profile_id(&conn);
+    Ok(report_for(&conn, &from, &to))
+}
+
+/// Builds the report for a date range. Free of Tauri so it can be unit tested.
+fn report_for(conn: &Connection, from: &str, to: &str) -> Report {
+    db::sync_active_entry(conn);
+    let profile = db::active_profile_id(conn);
     let from_ts = format!("{from}T00:00:00");
     let to_ts = format!("{to}T23:59:59");
 
+    // Hours cover every entry in the range; money only covers billable entries.
     let (total_seconds, total_earnings, entry_count): (i64, f64, i64) = conn
         .query_row(
-            "SELECT COALESCE(SUM(duration_sec),0), COALESCE(SUM(amount),0), COUNT(*)
+            "SELECT COALESCE(SUM(duration_sec),0),
+                    COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0), COUNT(*)
              FROM entries WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3",
             params![profile, from_ts, to_ts],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -749,7 +756,7 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
     let paid_earnings: f64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount),0) FROM entries
-             WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3 AND paid = 1",
+             WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3 AND billable = 1 AND paid = 1",
             params![profile, from_ts, to_ts],
             |row| row.get(0),
         )
@@ -757,7 +764,8 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
 
     let mut by_day = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT substr(started_at,1,10) AS day, COALESCE(SUM(duration_sec),0), COALESCE(SUM(amount),0)
+        "SELECT substr(started_at,1,10) AS day, COALESCE(SUM(duration_sec),0),
+                COALESCE(SUM(CASE WHEN billable = 1 THEN amount ELSE 0 END),0)
          FROM entries WHERE profile_id = ?1 AND started_at BETWEEN ?2 AND ?3
          GROUP BY day ORDER BY day ASC",
     ) {
@@ -781,7 +789,7 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
     let mut by_client = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT COALESCE(c.id,''), COALESCE(c.name,'ללא לקוח'), COALESCE(SUM(e.duration_sec),0),
-                COALESCE(SUM(e.amount),0), c.hourly_rate
+                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0), c.hourly_rate
          FROM entries e LEFT JOIN clients c ON c.id = e.client_id
          WHERE e.profile_id = ?1 AND e.started_at BETWEEN ?2 AND ?3
          GROUP BY COALESCE(c.id,'') ORDER BY 3 DESC",
@@ -802,7 +810,7 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
     let mut by_project = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT COALESCE(p.id,''), COALESCE(p.name,'ללא פרויקט'), COALESCE(SUM(e.duration_sec),0),
-                COALESCE(SUM(e.amount),0), p.color
+                COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.amount ELSE 0 END),0), p.color
          FROM entries e LEFT JOIN projects p ON p.id = e.project_id
          WHERE e.profile_id = ?1 AND e.started_at BETWEEN ?2 AND ?3
          GROUP BY COALESCE(p.id,'') ORDER BY 3 DESC",
@@ -830,9 +838,9 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
         }
     }
 
-    Ok(Report {
-        from,
-        to,
+    Report {
+        from: from.to_string(),
+        to: to.to_string(),
         total_seconds,
         billable_seconds,
         total_earnings: db::round_amount(total_earnings),
@@ -843,7 +851,118 @@ pub fn report(state: State<'_, AppState>, from: String, to: String) -> CmdResult
         by_client,
         by_project,
         entries,
-    })
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// A seeded in-memory database with the production schema, shared by the unit tests.
+    fn fixture() -> Connection {
+        let conn = db::test_connection();
+        let profile = db::active_profile_id(&conn);
+        conn.execute(
+            "INSERT INTO clients (id, profile_id, name, created_at)
+             VALUES ('c1', ?1, 'client', '2026-01-01T00:00:00')",
+            params![profile],
+        )
+        .expect("client");
+        conn.execute(
+            "INSERT INTO projects (id, profile_id, client_id, name, created_at)
+             VALUES ('pr1', ?1, 'c1', 'project', '2026-01-01T00:00:00')",
+            params![profile],
+        )
+        .expect("project");
+
+        // Billable and still unpaid.
+        insert_entry(&conn, &profile, "b1", "2026-11-02T09:00:00", 3600, 100.0, true, false);
+        // Not billable but priced: this is the money that must not leak into the totals.
+        insert_entry(&conn, &profile, "nb1", "2026-11-02T13:00:00", 7200, 200.0, false, false);
+        // Billable and paid.
+        insert_entry(&conn, &profile, "b2", "2026-11-03T10:00:00", 1800, 50.0, true, true);
+        // A whole day of non-billable work.
+        insert_entry(&conn, &profile, "nb2", "2026-11-04T10:00:00", 3600, 90.0, false, false);
+        // Non-billable and flagged as paid.
+        insert_entry(&conn, &profile, "nb3", "2026-11-05T10:00:00", 3600, 70.0, false, true);
+
+        conn
+    }
+
+    fn insert_entry(
+        conn: &Connection,
+        profile_id: &str,
+        id: &str,
+        started_at: &str,
+        duration_sec: i64,
+        amount: f64,
+        billable: bool,
+        paid: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO entries (id, profile_id, project_id, client_id, description, started_at,
+                ended_at, duration_sec, rate, amount, billable, paid, created_at)
+             VALUES (?1, ?2, 'pr1', 'c1', '', ?3, ?3, ?4, 100, ?5, ?6, ?7, ?3)",
+            params![
+                id,
+                profile_id,
+                started_at,
+                duration_sec,
+                amount,
+                billable as i64,
+                paid as i64
+            ],
+        )
+        .expect("entry");
+    }
+
+    fn row<'a>(rows: &'a [SummaryRow], key: &str) -> &'a SummaryRow {
+        rows.iter().find(|row| row.key == key).expect("row")
+    }
+
+    #[test]
+    fn report_counts_hours_from_every_entry_but_money_only_from_billable_ones() {
+        let conn = fixture();
+        let report = report_for(&conn, "2026-11-01", "2026-11-30");
+
+        assert_eq!((report.from.as_str(), report.to.as_str()), ("2026-11-01", "2026-11-30"));
+        assert_eq!(report.entry_count, 5);
+        assert_eq!(report.total_seconds, 19_800, "every entry counts towards the hours");
+        assert_eq!(report.billable_seconds, 5_400, "3600 + 1800");
+        assert_eq!(report.total_earnings, 150.0, "100 + 50, not the 460 stored on all five");
+        assert_eq!(report.paid_earnings, 50.0, "the paid non-billable 70 is not earnings");
+        assert_eq!(report.unpaid_earnings, 100.0);
+
+        let day = row(&report.by_day, "2026-11-02");
+        assert_eq!(day.seconds, 10_800, "the non-billable 7200s still shows up as hours");
+        assert_eq!(day.earnings, 100.0, "but only the billable 100 is money");
+        assert_eq!(row(&report.by_day, "2026-11-04").seconds, 3_600);
+        assert_eq!(row(&report.by_day, "2026-11-04").earnings, 0.0);
+
+        let client = row(&report.by_client, "c1");
+        assert_eq!(client.seconds, 19_800);
+        assert_eq!(client.earnings, 150.0);
+
+        let project = row(&report.by_project, "pr1");
+        assert_eq!(project.seconds, 19_800);
+        assert_eq!(project.earnings, 150.0);
+    }
+
+    #[test]
+    fn report_shows_hours_but_no_money_for_a_non_billable_day() {
+        let conn = fixture();
+        let report = report_for(&conn, "2026-11-04", "2026-11-04");
+
+        assert_eq!(report.entry_count, 1);
+        assert_eq!(report.total_seconds, 3_600, "the hours are still reported");
+        assert_eq!(report.billable_seconds, 0);
+        assert_eq!(report.total_earnings, 0.0);
+        assert_eq!(report.paid_earnings, 0.0);
+        assert_eq!(report.unpaid_earnings, 0.0, "nothing is outstanding either");
+        assert_eq!(row(&report.by_day, "2026-11-04").earnings, 0.0);
+        assert_eq!(row(&report.by_client, "c1").earnings, 0.0);
+        assert_eq!(row(&report.by_project, "pr1").earnings, 0.0);
+    }
 }
 
 #[tauri::command]
